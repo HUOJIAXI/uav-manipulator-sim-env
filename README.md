@@ -1,168 +1,120 @@
-# UAV Warehouse Simulation with PX4 + Camera
+# UAV Simulation with PX4 + Stereo Camera + Manipulator
 
-This directory contains a complete Isaac Sim simulation with PX4-enabled quadrotor and camera.
+Isaac Sim simulation environment with PX4-enabled quadrotor, stereo cameras, and a 2-DOF folding arm.
 
-## 🚀 Quick Start
+## Launch Files
+
+| Script | UAV Body | Stereo Camera | Folding Arm | Description |
+|--------|----------|---------------|-------------|-------------|
+| `launch_with_camera.py` | Iris | No (mono) | No | Basic mono camera setup |
+| `launch_with_stereo_camera.py` | Iris | Yes | No | Stereo camera on default Iris |
+| `launch_with_arm.py` | Iris | No | Yes | Iris with folding arm |
+| `launch_stereo_default.py` | Iris | Yes | No | Stereo on default Iris (Pegasus env) |
+| `launch_stereo_default_with_arm.py` | Iris | Yes | Yes | Stereo + arm on default Iris |
+| `launch_stereo_vslam_with_arm.py` | Iris VSLAM | Yes | Yes | VSLAM body + stereo + arm (recommended) |
+
+## Quick Start
 
 ```bash
 cd ~/Desktop/uav_sim
-./run_sim.sh
+
+# Recommended: Iris VSLAM body with stereo cameras + folding arm
+~/.local/share/ov/pkg/isaac-sim-4.2.0/python.sh launch_stereo_vslam_with_arm.py
 ```
 
-## 📋 What It Does
+Wait for `READY!` and PX4 console output.
 
-1. ✅ Loads your warehouse environment (`uav_warehouse.usd`)
-2. ✅ Spawns Pegasus Iris quadrotor with PX4 SITL
-3. ✅ Attaches forward-facing camera to the UAV
-4. ✅ Camera moves with UAV and faces flight direction
+## `launch_stereo_vslam_with_arm.py` Pipeline
 
-## 🎥 Camera Details
+This is the main launch file. It uses the `iris_vslam.usd` model (from `assets/`) with a workaround for Isaac Sim 5.1 compatibility:
 
-- **Location**: `/World/quadrotor/body/camera`
-- **Position**: 10cm forward, 5cm up from body center
-- **Resolution**: 640x480 @ 30fps
-- **Orientation**: Faces forward, aligned with UAV movement
+1. **Load environment** - Pegasus Curved Gridroom
+2. **Spawn vehicle** - Iris VSLAM body from `assets/iris_vslam.usd`
+3. **Clean stale OmniGraph** - Removes old `omni.isaac.*` action graphs embedded in the USD (incompatible with Isaac Sim 5.1's `isaacsim.*` node types)
+4. **Create stereo camera prims** - Fresh pinhole cameras on `/World/quadrotor/body/stereo_left` and `stereo_right` (50 mm baseline, forward-looking)
+5. **Reset world** - Initialize physics articulations
+6. **Add landing legs** - Cylinder legs below each rotor
+7. **Add 2-DOF folding arm** - Shoulder + elbow revolute joints with position drive, attached to body via FixedJoint
+8. **Start ROS2 arm bridge** - Subscribes to joint commands, publishes joint states
+9. **Play timeline + warm up renderer**
+10. **Create viewport-based stereo camera publishers** - Hidden viewports with `schedule_capture(ByteCapture(...))` to bypass broken SyntheticData pipeline, publishing via ROS2
 
-## 📡 Using with ROS2
+### Why viewport capture instead of replicator writers?
 
-### Step 1: Launch Simulation
+The `iris_vslam.usd` contains embedded OmniGraph nodes using old Isaac Sim 4.x node type names (`omni.isaac.core_nodes.*`, `omni.isaac.ros2_bridge.*`). These are not resolved by Isaac Sim 5.1 and corrupt the global `SyntheticData` singleton, causing all `annotator.attach()` and `writer.attach()` calls to fail with `TypeError: Unable to write from unknown dtype`. The viewport capture path (`viewport_api.schedule_capture`) bypasses SyntheticData entirely.
+
+## ROS2 Topics
+
+### Stereo Camera
+| Topic | Type | Description |
+|-------|------|-------------|
+| `front_stereo_camera/left/image_rect_color` | `sensor_msgs/Image` | Left camera RGBA image |
+| `front_stereo_camera/left/camera_info` | `sensor_msgs/CameraInfo` | Left camera intrinsics |
+| `front_stereo_camera/right/image_rect_color` | `sensor_msgs/Image` | Right camera RGBA image |
+| `front_stereo_camera/right/camera_info` | `sensor_msgs/CameraInfo` | Right camera intrinsics |
+
+### Folding Arm
+| Topic | Type | Description |
+|-------|------|-------------|
+| `drone0/arm/joint_states` | `sensor_msgs/JointState` | Current arm joint positions |
+| `drone0/arm/joint_command` | `sensor_msgs/JointState` | Send arm joint commands (radians) |
+
+### Control the Arm
 ```bash
-./run_sim.sh
+# Unfold arm (shoulder=0, elbow=0)
+ros2 topic pub --once drone0/arm/joint_command sensor_msgs/msg/JointState \
+  "{name: ['shoulder_joint','elbow_joint'], position: [0.0, 0.0]}"
+
+# Fold arm (shoulder=-90deg, elbow=180deg)
+ros2 topic pub --once drone0/arm/joint_command sensor_msgs/msg/JointState \
+  "{name: ['shoulder_joint','elbow_joint'], position: [-1.5708, 3.1416]}"
 ```
 
-Wait for: `READY!` and PX4 console output
-
-### Step 2: Enable ROS2 Bridge (for camera topics)
-In Isaac Sim:
-- **Window → Extensions**
-- Search "Isaac ROS2 Bridge"
-- Enable it
-
-### Step 3: Launch ROS2 Offboard Control
-```bash
-# Terminal 2
-cd ~/Desktop/quadrotor_ws
-source install/setup.bash
-ros2 launch px4_offboard_control offboard.launch.py use_sim_time:=true
-```
-
-**Important:** Always use `use_sim_time:=true` - the simulation publishes clock to `/clock` topic.
-
-### Step 4: Check Camera Topics
-```bash
-# Terminal 3
-export ROS_DISTRO=jazzy
-export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:~/isaac-sim/exts/isaacsim.ros2.bridge/jazzy/lib
-
-ros2 topic list | grep camera
-ros2 topic echo /camera/rgb/image_raw --once
-```
-
-## 📁 Files
-
-- `uav_warehouse.usd` - Your warehouse scene
-- `launch_with_camera.py` - Main Python script
-- `run_sim.sh` - Launcher script
-- `README.md` - This file
-
-## ⏱️ Simulation Time (use_sim_time)
-
-The simulation automatically publishes simulation time to the `/clock` topic. This allows ROS2 nodes to synchronize with the simulation time instead of using wall clock time.
-
-**Always use `use_sim_time:=true` when launching ROS2 nodes:**
+### Launch Offboard Control
 ```bash
 ros2 launch px4_offboard_control offboard.launch.py use_sim_time:=true
-ros2 run your_package your_node --ros-args -p use_sim_time:=true
 ```
 
-**Benefits:**
-- Consistent timing in slow/fast simulations
-- Repeatable experiments
-- Proper tf transforms and time-based algorithms
+## Stereo Camera Parameters
 
-**Verify clock is publishing:**
-```bash
-ros2 topic hz /clock
-ros2 topic echo /clock --once
+| Parameter | Value |
+|-----------|-------|
+| Baseline | 50 mm |
+| Forward offset | 100 mm from body center |
+| Resolution | 640 x 480 |
+| Projection | Pinhole |
+| Encoding | RGBA8 |
+| Publish rate | ~10 Hz |
+
+## Folding Arm Parameters
+
+| Parameter | Value |
+|-----------|-------|
+| Link length | 125 mm per link |
+| Link radius | 8 mm |
+| Link mass | 50 g per link |
+| Joints | Shoulder (Y-axis, -90 to 90 deg), Elbow (Y-axis, 0 to 180 deg) |
+| Default state | Folded (shoulder=-90, elbow=180) |
+| Drive | Position control (stiffness=1e5, damping=1e4) |
+
+## Project Structure
+
+```
+uav_sim/
+  assets/
+    iris_vslam.usd          # Iris VSLAM quadrotor model
+  launch_stereo_vslam_with_arm.py   # Main launch file (recommended)
+  launch_stereo_default_with_arm.py # Default Iris + stereo + arm
+  launch_stereo_default.py          # Default Iris + stereo
+  launch_with_stereo_camera.py      # Stereo camera setup
+  launch_with_camera.py             # Basic mono camera
+  launch_with_arm.py                # Iris + arm
+  run_sim.sh                        # Legacy launcher
+  README.md
 ```
 
-## 🔧 Customization
+## Requirements
 
-### Adjust Camera Position
-Edit `launch_with_camera.py` line ~105:
-```python
-position=[0.1, 0.0, 0.05],  # [forward, right, up] in meters
-```
-
-### Adjust Camera Angle
-Edit `launch_with_camera.py` line ~98:
-```python
-camera_rot = R.from_euler('xyz', [-90, 0, 90], degrees=True)
-```
-
-### Change Resolution
-Edit `launch_with_camera.py` line ~114:
-```python
-resolution=(640, 480),  # (width, height)
-frequency=30  # FPS
-```
-
-## 🎯 System Requirements
-
-- Isaac Sim (with Pegasus Simulator extension)
-- PX4-Autopilot at `~/Pegasus/PX4-Autopilot`
-- ROS2 Humble (for offboard control)
-
-## ✨ Features
-
-- ✅ PX4 SITL auto-starts with simulation
-- ✅ Camera rigidly attached to UAV body
-- ✅ MAVLink connection ready for ROS2
-- ✅ Forward-facing FPV camera view
-- ✅ ROS2 Bridge support for camera topics
-- ✅ **Auto-loads action graphs from USD**
-- ✅ **Improved timing for reliable startup**
-- ✅ **ROS2 Clock publisher for simulation time** (new!)
-
-## 🔧 Troubleshooting
-
-### Intermittent Crashes During Launch
-
-The script now includes strategic timing delays (~6.5s total) to prevent race conditions:
-- Waits for stage to fully load
-- Waits for physics engine to stabilize
-- Verifies vehicle body prim exists before adding camera
-- Updates simulation app before starting timeline
-
-**If crashes still occur:**
-- Check Isaac Sim console for error messages
-- Ensure PX4-Autopilot is at `~/Pegasus/PX4-Autopilot`
-- Try closing Isaac Sim completely and relaunching
-
-### Action Graphs Not Working
-
-The script automatically:
-1. Searches for action graphs in your USD
-2. Enables their pipelines
-3. Evaluates them before and after simulation starts
-
-**If action graphs still don't load:**
-- Check the launch console - it will list found graphs
-- Manually enable ROS2 Bridge: Window → Extensions → "Isaac ROS2 Bridge"
-- Verify your USD contains valid action graph prims
-
-### Camera Not Publishing
-
-1. Enable ROS2 Bridge extension manually (if not auto-enabled)
-2. Check ROS2 environment in separate terminal:
-```bash
-export ROS_DISTRO=jazzy
-export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:~/isaac-sim/exts/isaacsim.ros2.bridge/jazzy/lib
-ros2 topic list | grep camera
-```
-
----
-
-**Enjoy flying!** 🚁📷
+- Isaac Sim 5.1 (with Pegasus Simulator extension)
+- PX4-Autopilot
+- ROS2 (Jazzy/Humble)
