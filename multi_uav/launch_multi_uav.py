@@ -111,7 +111,7 @@ def main():
     print("  Environment loaded\n")
 
     # --- Spawning and simulation ---
-    from multi_uav.spawn_uav import spawn_uav, create_arm, ArmBridgeNode, StereoCamPublisher
+    from spawn_uav import spawn_uav, create_arm, ArmBridgeNode, StereoCamPublisher
 
     stage = omni.usd.get_context().get_stage()
 
