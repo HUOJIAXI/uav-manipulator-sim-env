@@ -1,0 +1,21 @@
+environment: "Curved Gridroom"
+spawn_height: 0.30
+
+drones:
+  - id: 0
+    x: 0.0
+    y: 0.0
+    yaw: 0.0
+    stereo_camera: true
+    arm: true
+    px4_autolaunch: true
+    px4_vehicle_id: 0
+
+  - id: 1
+    x: 2.0
+    y: 0.0
+    yaw: 90.0
+    stereo_camera: true
+    arm: true
+    px4_autolaunch: true
+    px4_vehicle_id: 1
