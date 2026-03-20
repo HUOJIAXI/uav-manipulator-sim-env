@@ -66,7 +66,7 @@ def main():
         default=os.path.join(os.path.dirname(__file__), "config", "default_config.yaml"),
         help="Path to YAML config file",
     )
-    args = parser.parse_args()
+    args, _ = parser.parse_known_args()
 
     # Validate asset exists
     assets_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets")
