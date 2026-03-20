@@ -26,9 +26,12 @@ def load_config(config_path):
         print("ERROR: Config must define at least one drone in 'drones' list.")
         sys.exit(1)
 
-    # Validate drone id uniqueness
+    # Validate required fields and drone id uniqueness
     id_set = set()
-    for d in drones:
+    for i, d in enumerate(drones):
+        if "id" not in d:
+            print(f"ERROR: Drone entry {i} missing required 'id' field.")
+            sys.exit(1)
         did = d["id"]
         if did in id_set:
             print(f"ERROR: Duplicate drone id={did} in config.")
@@ -221,6 +224,10 @@ def main():
         print("\nPress Ctrl+C to exit\n")
 
         # --- Simulation loop ---
+        if not hasattr(world, 'current_time'):
+            import carb
+            carb.log_warn("World has no 'current_time' attribute; timestamps will be 0.0")
+
         pub_counter = 0
         while simulation_app.is_running():
             world.step(render=True)
