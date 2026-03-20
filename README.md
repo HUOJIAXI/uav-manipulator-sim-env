@@ -1,81 +1,146 @@
 # UAV Simulation with PX4 + Stereo Camera + Manipulator
 
-Isaac Sim simulation environment with PX4-enabled quadrotor, stereo cameras, and a 2-DOF folding arm.
-
-## Launch Files
-
-| Script | UAV Body | Stereo Camera | Folding Arm | Description |
-|--------|----------|---------------|-------------|-------------|
-| `launch_with_camera.py` | Iris | No (mono) | No | Basic mono camera setup |
-| `launch_with_stereo_camera.py` | Iris | Yes | No | Stereo camera on default Iris |
-| `launch_with_arm.py` | Iris | No | Yes | Iris with folding arm |
-| `launch_stereo_default.py` | Iris | Yes | No | Stereo on default Iris (Pegasus env) |
-| `launch_stereo_default_with_arm.py` | Iris | Yes | Yes | Stereo + arm on default Iris |
-| `launch_stereo_vslam_with_arm.py` | Iris VSLAM | Yes | Yes | VSLAM body + stereo + arm (recommended) |
+Isaac Sim simulation environment with PX4-enabled quadrotors, stereo cameras, and 2-DOF folding arms. Supports single and multi-UAV configurations.
 
 ## Quick Start
 
+### Single UAV
+
 ```bash
 cd ~/Desktop/uav_sim
+isaac_run launch_stereo_vslam_with_arm.py
+```
 
-# Recommended: Iris VSLAM body with stereo cameras + folding arm
-~/.local/share/ov/pkg/isaac-sim-4.2.0/python.sh launch_stereo_vslam_with_arm.py
+### Multi-UAV
+
+```bash
+cd ~/Desktop/uav_sim/multi_uav
+
+# Default config (1 drone at origin)
+isaac_run launch_multi_uav.py
+
+# 2 drones from example config
+isaac_run launch_multi_uav.py --config config/example_config.yaml
 ```
 
 Wait for `READY!` and PX4 console output.
 
-## `launch_stereo_vslam_with_arm.py` Pipeline
+## Multi-UAV System
 
-This is the main launch file. It uses the `iris_vslam.usd` model (from `assets/`) with a workaround for Isaac Sim 5.1 compatibility:
+The `multi_uav/` directory contains the multi-UAV spawning system. It uses a YAML config file to define how many drones to spawn and their configurations.
 
-1. **Load environment** - Pegasus Curved Gridroom
-2. **Spawn vehicle** - Iris VSLAM body from `assets/iris_vslam.usd`
-3. **Clean stale OmniGraph** - Removes old `omni.isaac.*` action graphs embedded in the USD (incompatible with Isaac Sim 5.1's `isaacsim.*` node types)
-4. **Create stereo camera prims** - Fresh pinhole cameras on `/World/quadrotor/body/stereo_left` and `stereo_right` (50 mm baseline, forward-looking)
-5. **Reset world** - Initialize physics articulations
-6. **Add landing legs** - Cylinder legs below each rotor
-7. **Add 2-DOF folding arm** - Shoulder + elbow revolute joints with position drive, attached to body via FixedJoint
-8. **Start ROS2 arm bridge** - Subscribes to joint commands, publishes joint states
-9. **Play timeline + warm up renderer**
-10. **Create viewport-based stereo camera publishers** - Hidden viewports with `schedule_capture(ByteCapture(...))` to bypass broken SyntheticData pipeline, publishing via ROS2
+### Config Format
 
-### Why viewport capture instead of replicator writers?
+```yaml
+environment: "Curved Gridroom"
+spawn_height: 0.30
 
-The `iris_vslam.usd` contains embedded OmniGraph nodes using old Isaac Sim 4.x node type names (`omni.isaac.core_nodes.*`, `omni.isaac.ros2_bridge.*`). These are not resolved by Isaac Sim 5.1 and corrupt the global `SyntheticData` singleton, causing all `annotator.attach()` and `writer.attach()` calls to fail with `TypeError: Unable to write from unknown dtype`. The viewport capture path (`viewport_api.schedule_capture`) bypasses SyntheticData entirely.
+drones:
+  - id: 0
+    x: 0.0
+    y: 0.0
+    yaw: 0.0
+    stereo_camera: true    # default: true
+    arm: true              # default: true
+    px4_autolaunch: true
+    px4_vehicle_id: 0
 
-## ROS2 Topics
+  - id: 1
+    x: 2.0
+    y: 0.0
+    yaw: 90.0
+    stereo_camera: true
+    arm: true
+    px4_autolaunch: true
+    px4_vehicle_id: 1
+```
+
+Each drone gets:
+- Its own PX4 SITL instance (unique `px4_vehicle_id`)
+- USD prims under `/World/droneN/`
+- ROS2 topics prefixed with `droneN/`
+- Optional stereo cameras and 2-DOF arm (per-drone toggle)
+
+### ROS2 Topics (Multi-UAV)
+
+For each drone N:
+
+| Topic | Type | Description |
+|-------|------|-------------|
+| `droneN/front_stereo_camera/left/image_rect_color` | `sensor_msgs/Image` | Left stereo image |
+| `droneN/front_stereo_camera/left/camera_info` | `sensor_msgs/CameraInfo` | Left camera intrinsics |
+| `droneN/front_stereo_camera/right/image_rect_color` | `sensor_msgs/Image` | Right stereo image |
+| `droneN/front_stereo_camera/right/camera_info` | `sensor_msgs/CameraInfo` | Right camera intrinsics |
+| `droneN/arm/joint_states` | `sensor_msgs/JointState` | Arm joint positions |
+| `droneN/arm/joint_command` | `sensor_msgs/JointState` | Arm joint commands (radians) |
+
+### Launching Controllers
+
+After the simulation is running, launch the multi-drone controller stack:
+
+```bash
+cd ~/Desktop/quadrotor_ws
+source install/setup.bash
+ros2 launch uav_position_controller multi_drone.launch.py num_drones:=2
+```
+
+This launches per-drone: mavsdk_server, offboard_node, position controller, arm compensation, and a shared arm GUI with drone selector.
+
+### Arm Control (Multi-UAV)
+
+```bash
+# Deploy drone1's arm
+ros2 run flexible_arm_controller arm_command --ros-args -p drone_id:=1 -p shoulder:=0.0 -p elbow:=0.0
+
+# Fold drone0's arm
+ros2 run flexible_arm_controller arm_command --ros-args -p drone_id:=0 -p shoulder:=-90.0 -p elbow:=180.0
+```
+
+## Single UAV Launch Files
+
+| Script | Stereo Camera | Folding Arm | Description |
+|--------|---------------|-------------|-------------|
+| `launch_stereo_vslam_with_arm.py` | Yes | Yes | VSLAM body + stereo + arm (recommended) |
+| `launch_stereo_default_with_arm.py` | Yes | Yes | Default Iris + stereo + arm |
+| `launch_stereo_default.py` | Yes | No | Default Iris + stereo |
+| `launch_with_stereo_camera.py` | Yes | No | Stereo camera setup |
+| `launch_with_camera.py` | No (mono) | No | Basic mono camera |
+| `launch_with_arm.py` | No | Yes | Iris + arm |
+
+### Single UAV ROS2 Topics
+
+| Topic | Type | Description |
+|-------|------|-------------|
+| `front_stereo_camera/left/image_rect_color` | `sensor_msgs/Image` | Left RGBA image |
+| `front_stereo_camera/left/camera_info` | `sensor_msgs/CameraInfo` | Left intrinsics |
+| `front_stereo_camera/right/image_rect_color` | `sensor_msgs/Image` | Right RGBA image |
+| `front_stereo_camera/right/camera_info` | `sensor_msgs/CameraInfo` | Right intrinsics |
+| `drone0/arm/joint_states` | `sensor_msgs/JointState` | Arm joint positions |
+| `drone0/arm/joint_command` | `sensor_msgs/JointState` | Arm joint commands |
+
+## Project Structure
+
+```
+uav_sim/
+  assets/
+    iris_vslam.usd                    # Iris VSLAM quadrotor model
+  multi_uav/
+    launch_multi_uav.py               # Multi-UAV launch script
+    spawn_uav.py                      # Factory functions (spawn_uav, create_arm)
+    config/
+      default_config.yaml             # Single drone fallback
+      example_config.yaml             # Two-drone example
+  launch_stereo_vslam_with_arm.py     # Single-UAV launch (recommended)
+  launch_stereo_default_with_arm.py
+  launch_stereo_default.py
+  launch_with_stereo_camera.py
+  launch_with_camera.py
+  launch_with_arm.py
+```
+
+## Hardware Parameters
 
 ### Stereo Camera
-| Topic | Type | Description |
-|-------|------|-------------|
-| `front_stereo_camera/left/image_rect_color` | `sensor_msgs/Image` | Left camera RGBA image |
-| `front_stereo_camera/left/camera_info` | `sensor_msgs/CameraInfo` | Left camera intrinsics |
-| `front_stereo_camera/right/image_rect_color` | `sensor_msgs/Image` | Right camera RGBA image |
-| `front_stereo_camera/right/camera_info` | `sensor_msgs/CameraInfo` | Right camera intrinsics |
-
-### Folding Arm
-| Topic | Type | Description |
-|-------|------|-------------|
-| `drone0/arm/joint_states` | `sensor_msgs/JointState` | Current arm joint positions |
-| `drone0/arm/joint_command` | `sensor_msgs/JointState` | Send arm joint commands (radians) |
-
-### Control the Arm
-```bash
-# Unfold arm (shoulder=0, elbow=0)
-ros2 topic pub --once drone0/arm/joint_command sensor_msgs/msg/JointState \
-  "{name: ['shoulder_joint','elbow_joint'], position: [0.0, 0.0]}"
-
-# Fold arm (shoulder=-90deg, elbow=180deg)
-ros2 topic pub --once drone0/arm/joint_command sensor_msgs/msg/JointState \
-  "{name: ['shoulder_joint','elbow_joint'], position: [-1.5708, 3.1416]}"
-```
-
-### Launch Offboard Control
-```bash
-ros2 launch px4_offboard_control offboard.launch.py use_sim_time:=true
-```
-
-## Stereo Camera Parameters
 
 | Parameter | Value |
 |-----------|-------|
@@ -86,7 +151,7 @@ ros2 launch px4_offboard_control offboard.launch.py use_sim_time:=true
 | Encoding | RGBA8 |
 | Publish rate | ~10 Hz |
 
-## Folding Arm Parameters
+### Folding Arm
 
 | Parameter | Value |
 |-----------|-------|
@@ -97,24 +162,9 @@ ros2 launch px4_offboard_control offboard.launch.py use_sim_time:=true
 | Default state | Folded (shoulder=-90, elbow=180) |
 | Drive | Position control (stiffness=1e5, damping=1e4) |
 
-## Project Structure
-
-```
-uav_sim/
-  assets/
-    iris_vslam.usd          # Iris VSLAM quadrotor model
-  launch_stereo_vslam_with_arm.py   # Main launch file (recommended)
-  launch_stereo_default_with_arm.py # Default Iris + stereo + arm
-  launch_stereo_default.py          # Default Iris + stereo
-  launch_with_stereo_camera.py      # Stereo camera setup
-  launch_with_camera.py             # Basic mono camera
-  launch_with_arm.py                # Iris + arm
-  run_sim.sh                        # Legacy launcher
-  README.md
-```
-
 ## Requirements
 
 - Isaac Sim 5.1 (with Pegasus Simulator extension)
 - PX4-Autopilot
-- ROS2 (Jazzy/Humble)
+- ROS2 (Jazzy)
+- PyYAML (`pip install pyyaml`)
