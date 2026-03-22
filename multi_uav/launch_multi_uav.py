@@ -111,7 +111,7 @@ def main():
     print("  Environment loaded\n")
 
     # --- Spawning and simulation ---
-    from spawn_uav import spawn_uav, create_arm, ArmBridgeNode, StereoCamPublisher
+    from spawn_uav import spawn_uav, create_stereo_cameras, create_arm, ArmBridgeNode, StereoCamPublisher
 
     stage = omni.usd.get_context().get_stage()
 
@@ -128,7 +128,12 @@ def main():
     world.reset()
     stage = omni.usd.get_context().get_stage()
 
-    # --- Phase 2: Create legs + arms (after world.reset()) ---
+    # --- Phase 2: Create cameras, legs + arms (after world.reset()) ---
+    print("Creating stereo cameras...")
+    for i, dcfg in enumerate(drones_cfg):
+        cam_paths = create_stereo_cameras(stage, dcfg, spawn_height, simulation_app)
+        drone_handles[i]["stereo_cam_paths"] = cam_paths
+
     print("Creating legs and arms...")
     for i, dcfg in enumerate(drones_cfg):
         arm_result = create_arm(stage, dcfg, spawn_height, simulation_app)

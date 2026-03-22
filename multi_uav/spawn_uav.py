@@ -5,6 +5,7 @@ import math
 import threading
 import ctypes
 
+import numpy as np
 import carb
 from scipy.spatial.transform import Rotation
 from pxr import UsdGeom, UsdPhysics, Gf, Sdf
@@ -25,7 +26,7 @@ from std_msgs.msg import Header
 # Camera constants (matching iris_vslam.usd RSD455)
 STEREO_BASELINE = 0.050       # 50 mm
 CAMERA_FORWARD = 0.10         # 10 cm forward from body centre
-CAMERA_UP = 0.0
+CAMERA_UP = 0.05              # 5 cm above body centre
 
 # Landing leg constants
 LEG_LENGTH = 0.20             # 20 cm
@@ -47,13 +48,14 @@ JOINT_STIFFNESS = 1e5
 JOINT_DAMPING = 1e4
 
 # Camera orientation: forward-looking on drone body
-# Isaac Sim cameras look along local -Z -> rotate so -Z_cam aligns with +X_body
-CAM_QUAT = Rotation.from_euler('xyz', [-90, 0, 90], degrees=True).as_quat()
+# Isaac Sim cameras look along local -Z with +Y up (OpenGL convention).
+# Rotate so: -Z_cam -> +X_body (forward), +Y_cam -> +Z_body (up), +X_cam -> -Y_body (right)
+CAM_QUAT = Rotation.from_euler('xyz', [90, 0, -90], degrees=True).as_quat()
 
 
 def spawn_uav(stage, world, drone_cfg, spawn_height, assets_dir, sim_app):
     """
-    Spawns a UAV body (Multirotor, cameras) before world.reset().
+    Spawns a UAV body (Multirotor only) before world.reset().
 
     Args:
         stage: USD stage
@@ -64,7 +66,7 @@ def spawn_uav(stage, world, drone_cfg, spawn_height, assets_dir, sim_app):
         sim_app: SimulationApp instance
 
     Returns:
-        dict with keys: "drone_id", "multirotor", "stereo_cam_paths"
+        dict with keys: "drone_id", "multirotor"
     """
     drone_id = drone_cfg["id"]
     prefix = f"/World/drone{drone_id}"
@@ -115,29 +117,92 @@ def spawn_uav(stage, world, drone_cfg, spawn_height, assets_dir, sim_app):
         stage.RemovePrim(gpath)
         print(f"  drone{drone_id}: Removed stale graph: {gpath}")
 
-    # --- 3. Stereo camera prims ---
-    stereo_cam_paths = None
-    if drone_cfg.get("stereo_camera", True):
-        half_baseline = STEREO_BASELINE / 2.0
-        stereo_cam_paths = {}
-        body_path = f"{prefix}/quadrotor/body"
-        for side, y_offset in [("left", half_baseline), ("right", -half_baseline)]:
-            cam_path = f"{body_path}/stereo_{side}"
-            create_prim(
-                cam_path,
-                "Camera",
-                position=[CAMERA_FORWARD, y_offset, CAMERA_UP],
-                orientation=CAM_QUAT,
-            )
-            stereo_cam_paths[side] = cam_path
-            print(f"  drone{drone_id}: stereo_{side} at {cam_path}")
-        sim_app.update()
-
     return {
         "drone_id": drone_id,
         "multirotor": multirotor,
-        "stereo_cam_paths": stereo_cam_paths,
     }
+
+
+def create_stereo_cameras(stage, drone_cfg, spawn_height, sim_app):
+    """
+    Creates stereo camera prims on a drone. Must be called AFTER world.reset().
+
+    Cameras are mounted via FixedJoint (same pattern as the arm) so they
+    follow the drone body during physics simulation.
+
+    Args:
+        stage: USD stage
+        drone_cfg: dict from YAML config for this drone
+        spawn_height: float, Z height for spawning
+        sim_app: SimulationApp instance
+
+    Returns:
+        dict mapping side name to cam prim path, or None if disabled
+    """
+    drone_id = drone_cfg["id"]
+    if not drone_cfg.get("stereo_camera", True):
+        return None
+
+    prefix = f"/World/drone{drone_id}"
+    body_path = f"{prefix}/quadrotor/body"
+    half_baseline = STEREO_BASELINE / 2.0
+    stereo_cam_paths = {}
+
+    dx = drone_cfg.get("x", 0.0)
+    dy = drone_cfg.get("y", 0.0)
+    yaw = drone_cfg.get("yaw", 0.0)
+    yaw_rot = Rotation.from_euler("Z", yaw, degrees=True)
+
+    # Camera orientation: scipy [x,y,z,w] -> Gf.Quatf(w,x,y,z)
+    cam_q = CAM_QUAT
+    cam_quat_gf = Gf.Quatf(float(cam_q[3]), float(cam_q[0]), float(cam_q[1]), float(cam_q[2]))
+
+    cam_root = f"{prefix}/stereo_cameras"
+    UsdGeom.Xform.Define(stage, cam_root)
+
+    for side, y_offset in [("left", half_baseline), ("right", -half_baseline)]:
+        # --- Rigid-body mount (follows drone body via FixedJoint) ---
+        mount_path = f"{cam_root}/mount_{side}"
+        mount_xform = UsdGeom.Xform.Define(stage, mount_path)
+
+        # Initial world position (so physics starts from correct pose)
+        local_pos = np.array([CAMERA_FORWARD, y_offset, CAMERA_UP])
+        world_offset = yaw_rot.apply(local_pos)
+        mx = UsdGeom.Xformable(mount_xform)
+        mx.ClearXformOpOrder()
+        mx.AddTranslateOp().Set(Gf.Vec3d(
+            dx + world_offset[0], dy + world_offset[1], spawn_height + world_offset[2]
+        ))
+
+        mount_prim = mount_xform.GetPrim()
+        UsdPhysics.RigidBodyAPI.Apply(mount_prim)
+        mass_api = UsdPhysics.MassAPI.Apply(mount_prim)
+        mass_api.GetMassAttr().Set(0.001)
+
+        # FixedJoint: drone body <-> camera mount (position only, no rotation)
+        joint = UsdPhysics.FixedJoint.Define(stage, Sdf.Path(f"{mount_path}/attach"))
+        joint.CreateBody0Rel().SetTargets([Sdf.Path(body_path)])
+        joint.CreateBody1Rel().SetTargets([Sdf.Path(mount_path)])
+        joint.CreateLocalPos0Attr().Set(
+            Gf.Vec3f(CAMERA_FORWARD, y_offset, CAMERA_UP)
+        )
+        joint.CreateLocalRot0Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+        joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+        joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+
+        # --- Camera prim (child of mount, with camera orientation) ---
+        cam_path = f"{mount_path}/camera"
+        cam_prim = stage.DefinePrim(cam_path, "Camera")
+        cam_xf = UsdGeom.Xformable(cam_prim)
+        cam_xf.ClearXformOpOrder()
+        cam_xf.AddOrientOp().Set(cam_quat_gf)
+
+        stereo_cam_paths[side] = cam_path
+        print(f"  drone{drone_id}: stereo_{side} at {cam_path}")
+
+    sim_app.update()
+
+    return stereo_cam_paths
 
 
 def create_arm(stage, drone_cfg, spawn_height, sim_app):
