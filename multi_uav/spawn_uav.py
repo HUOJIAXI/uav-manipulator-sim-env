@@ -20,6 +20,7 @@ from pegasus.simulator.logic.interface.pegasus_interface import PegasusInterface
 import rclpy
 from rclpy.node import Node as RclpyNode
 from sensor_msgs.msg import JointState, Image, CameraInfo as CameraInfoMsg
+from geometry_msgs.msg import PoseStamped
 from builtin_interfaces.msg import Time as TimeMsg
 from std_msgs.msg import Header
 
@@ -415,6 +416,47 @@ class ArmBridgeNode(RclpyNode):
         for name, drive in self.arm_drives.items():
             target = drive.GetTargetPositionAttr().Get()
             msg.position.append(math.radians(target if target else 0.0))
+        self.pub.publish(msg)
+
+
+class GroundTruthPublisher(RclpyNode):
+    """Per-drone ROS2 node for publishing ground truth pose from Isaac Sim."""
+
+    def __init__(self, drone_id, body_prim_path):
+        super().__init__(f"drone{drone_id}_ground_truth")
+        self.body_prim_path = body_prim_path
+        self.drone_id = drone_id
+
+        self.pub = self.create_publisher(
+            PoseStamped, f"drone{drone_id}/state/pose", 10
+        )
+
+    def publish_pose(self, stamp_sec, stage):
+        """Read body pose from USD stage and publish. Call from sim loop."""
+        body_prim = stage.GetPrimAtPath(self.body_prim_path)
+        if not body_prim.IsValid():
+            return
+
+        xformable = UsdGeom.Xformable(body_prim)
+        world_tf = xformable.ComputeLocalToWorldTransform(0)
+
+        translation = world_tf.ExtractTranslation()
+        rotation = world_tf.ExtractRotation()
+        quat = rotation.GetQuat()
+        qi = quat.GetImaginary()
+        qr = quat.GetReal()
+
+        msg = PoseStamped()
+        msg.header.stamp.sec = int(stamp_sec)
+        msg.header.stamp.nanosec = int((stamp_sec - int(stamp_sec)) * 1e9)
+        msg.header.frame_id = "map"
+        msg.pose.position.x = float(translation[0])
+        msg.pose.position.y = float(translation[1])
+        msg.pose.position.z = float(translation[2])
+        msg.pose.orientation.x = float(qi[0])
+        msg.pose.orientation.y = float(qi[1])
+        msg.pose.orientation.z = float(qi[2])
+        msg.pose.orientation.w = float(qr)
         self.pub.publish(msg)
 
 

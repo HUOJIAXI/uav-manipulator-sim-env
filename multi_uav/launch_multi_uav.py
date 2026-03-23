@@ -111,7 +111,7 @@ def main():
     print("  Environment loaded\n")
 
     # --- Spawning and simulation ---
-    from spawn_uav import spawn_uav, create_stereo_cameras, create_arm, ArmBridgeNode, StereoCamPublisher
+    from spawn_uav import spawn_uav, create_stereo_cameras, create_arm, ArmBridgeNode, StereoCamPublisher, GroundTruthPublisher
 
     stage = omni.usd.get_context().get_stage()
 
@@ -150,9 +150,18 @@ def main():
 
     arm_bridges = []
     stereo_pubs = []
+    gt_pubs = []
 
     for handle in drone_handles:
         did = handle["drone_id"]
+
+        # Ground truth pose publisher
+        body_path = f"/World/drone{did}/quadrotor/body"
+        gt_pub = GroundTruthPublisher(did, body_path)
+        executor.add_node(gt_pub)
+        gt_pubs.append(gt_pub)
+        handle["gt_pub"] = gt_pub
+        print(f"  drone{did}: ground truth publisher ready")
 
         # Arm bridge
         if handle.get("arm_drives"):
@@ -220,6 +229,7 @@ def main():
         for handle in drone_handles:
             did = handle["drone_id"]
             print(f"\n  drone{did}:")
+            print(f"    drone{did}/state/pose (ground truth)")
             if handle.get("arm_bridge"):
                 print(f"    drone{did}/arm/joint_command")
                 print(f"    drone{did}/arm/joint_states")
@@ -250,11 +260,15 @@ def main():
                     bridge.publish_states(sim_time)
                 for pub in stereo_pubs:
                     pub.capture_and_publish(sim_time)
+                for gt in gt_pubs:
+                    gt.publish_pose(sim_time, stage)
 
     except KeyboardInterrupt:
         print("\nShutting down...")
     finally:
         timeline.stop()
+        for gt in gt_pubs:
+            gt.destroy_node()
         for pub in stereo_pubs:
             pub.destroy_node()
         for bridge in arm_bridges:
