@@ -111,7 +111,10 @@ def main():
     print("  Environment loaded\n")
 
     # --- Spawning and simulation ---
-    from spawn_uav import spawn_uav, create_stereo_cameras, create_arm, ArmBridgeNode, StereoCamPublisher, GroundTruthPublisher
+    from spawn_uav import (
+        spawn_uav, create_stereo_cameras, create_arm, create_5dof_arm,
+        ArmBridgeNode, StereoCamPublisher, GroundTruthPublisher,
+    )
 
     stage = omni.usd.get_context().get_stage()
 
@@ -136,7 +139,11 @@ def main():
 
     print("Creating legs and arms...")
     for i, dcfg in enumerate(drones_cfg):
-        arm_result = create_arm(stage, dcfg, spawn_height, simulation_app)
+        arm_type = dcfg.get("arm_type", "2dof")
+        if arm_type == "5dof":
+            arm_result = create_5dof_arm(stage, dcfg, spawn_height, simulation_app)
+        else:
+            arm_result = create_arm(stage, dcfg, spawn_height, simulation_app)
         drone_handles[i].update(arm_result)
 
     # --- ROS2 setup ---
@@ -165,7 +172,11 @@ def main():
 
         # Arm bridge
         if handle.get("arm_drives"):
-            bridge = ArmBridgeNode(did, handle["arm_drives"])
+            bridge = ArmBridgeNode(
+                did, handle["arm_drives"],
+                linear_joints=handle.get("linear_joints"),
+                mimic_drives=handle.get("mimic_drives"),
+            )
             executor.add_node(bridge)
             arm_bridges.append(bridge)
             handle["arm_bridge"] = bridge

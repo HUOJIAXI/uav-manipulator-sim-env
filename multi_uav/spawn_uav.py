@@ -30,7 +30,8 @@ CAMERA_FORWARD = 0.10         # 10 cm forward from body centre
 CAMERA_UP = 0.05              # 5 cm above body centre
 
 # Landing leg constants
-LEG_LENGTH = 0.20             # 20 cm
+LEG_LENGTH = 0.20             # 20 cm (2-DOF arm version)
+LEG_LENGTH_5DOF = 0.55        # 55 cm (5-DOF arm version – clears straight-down arm)
 LEG_RADIUS = 0.005            # 5 mm
 ROTOR_POSITIONS = {
     "leg_front_right": (0.13, -0.22),
@@ -39,7 +40,7 @@ ROTOR_POSITIONS = {
     "leg_back_right":  (-0.13, -0.20),
 }
 
-# Arm constants
+# 2-DOF arm constants
 ARM_LINK_LENGTH = 0.125       # 12.5 cm per link
 ARM_LINK_RADIUS = 0.008       # 8 mm radius
 ARM_LINK_MASS = 0.05          # 50 g per link
@@ -47,6 +48,28 @@ ARM_HALF_LEN = ARM_LINK_LENGTH / 2.0
 SHOULDER_MOUNT_Z = -0.08      # mount point below body
 JOINT_STIFFNESS = 1e5
 JOINT_DAMPING = 1e4
+
+# OpenMANIPULATOR-X 5-DOF arm constants (4-DOF + 1-DOF gripper)
+# Dimensions from ROBOTIS URDF: https://emanual.robotis.com/docs/en/platform/openmanipulator_x/specification/
+OM_LINK1_LENGTH = 0.060       # Base rotation housing (J1->J2)
+OM_LINK2_LENGTH = 0.130       # Upper arm (J2->J3)
+OM_LINK3_LENGTH = 0.124       # Forearm (J3->J4)
+OM_LINK4_LENGTH = 0.082       # Wrist (J4->gripper base)
+OM_LINK_RADIUS = 0.010        # Capsule radius for arm links
+OM_FINGER_LENGTH = 0.040      # Gripper finger length
+OM_FINGER_RADIUS = 0.005      # Gripper finger radius
+OM_FINGER_OFFSET_Y = 0.021    # Finger Y-offset from centerline
+OM_MOUNT_Z = -0.08            # Mount point below drone body
+OM_JOINT_STIFFNESS = 1e5
+OM_JOINT_DAMPING = 1e4
+OM_GRIPPER_STIFFNESS = 1e4
+OM_GRIPPER_DAMPING = 1e3
+# Link masses from URDF (kg)
+OM_LINK1_MASS = 0.079
+OM_LINK2_MASS = 0.098
+OM_LINK3_MASS = 0.139
+OM_LINK4_MASS = 0.133
+OM_FINGER_MASS = 0.020
 
 # Camera orientation: forward-looking on drone body
 # Isaac Sim cameras look along local -Z with +Y up (OpenGL convention).
@@ -375,12 +398,321 @@ def create_arm(stage, drone_cfg, spawn_height, sim_app):
     }
 
 
+def create_5dof_arm(stage, drone_cfg, spawn_height, sim_app):
+    """
+    Creates landing legs and 5-DOF OpenMANIPULATOR-X arm for a drone after world.reset().
+
+    Kinematic chain: base_link -> J1(Z) -> link1 -> J2(Y) -> link2 -> J3(Y) -> link3
+                     -> J4(Y) -> link4 -> gripper(prismatic Y, 2 fingers)
+
+    Args:
+        stage: USD stage
+        drone_cfg: dict from YAML config for this drone
+        spawn_height: float, Z height
+        sim_app: SimulationApp instance
+
+    Returns:
+        dict with keys: "arm_drives", "linear_joints", "mimic_drives"
+    """
+    drone_id = drone_cfg["id"]
+    prefix = f"/World/drone{drone_id}"
+    body_path = f"{prefix}/quadrotor/body"
+    dx = drone_cfg.get("x", 0.0)
+    dy = drone_cfg.get("y", 0.0)
+
+    # --- Landing legs (longer than 2-DOF to clear the 5-DOF arm) ---
+    leg_z = -LEG_LENGTH_5DOF / 2.0
+    for leg_name, (rx, ry) in ROTOR_POSITIONS.items():
+        leg_path = f"{body_path}/{leg_name}"
+        leg_prim = UsdGeom.Cylinder.Define(stage, leg_path)
+        leg_prim.GetHeightAttr().Set(LEG_LENGTH_5DOF)
+        leg_prim.GetRadiusAttr().Set(LEG_RADIUS)
+        leg_prim.GetAxisAttr().Set("Z")
+        xform = UsdGeom.Xformable(leg_prim)
+        xform.ClearXformOpOrder()
+        xform.AddTranslateOp().Set(Gf.Vec3d(rx, ry, leg_z))
+        UsdPhysics.CollisionAPI.Apply(leg_prim.GetPrim())
+        leg_prim.GetDisplayColorAttr().Set([Gf.Vec3f(0.2, 0.2, 0.2)])
+
+    sim_app.update()
+    print(f"  drone{drone_id}: Landing legs added (5-DOF, {LEG_LENGTH_5DOF}m)")
+
+    # --- 5-DOF Arm ---
+    arm_enabled = drone_cfg.get("arm", True)
+    if not arm_enabled:
+        return {
+            "arm_drives": None, "linear_joints": set(), "mimic_drives": {},
+        }
+
+    arm_root = f"{prefix}/manipulator_5dof"
+    mount_wz = spawn_height + OM_MOUNT_Z
+
+    # Half-lengths for joint local positions
+    L1H = OM_LINK1_LENGTH / 2.0
+    L2H = OM_LINK2_LENGTH / 2.0
+    L3H = OM_LINK3_LENGTH / 2.0
+    L4H = OM_LINK4_LENGTH / 2.0
+    FH = OM_FINGER_LENGTH / 2.0
+
+    UsdGeom.Xform.Define(stage, arm_root)
+
+    # --- Base link (massless anchor) ---
+    base_path = f"{arm_root}/base_link"
+    base_xform = UsdGeom.Xform.Define(stage, base_path)
+    bx = UsdGeom.Xformable(base_xform)
+    bx.ClearXformOpOrder()
+    bx.AddTranslateOp().Set(Gf.Vec3d(dx, dy, mount_wz))
+    base_prim = base_xform.GetPrim()
+    UsdPhysics.RigidBodyAPI.Apply(base_prim)
+    mass_base = UsdPhysics.MassAPI.Apply(base_prim)
+    mass_base.GetMassAttr().Set(0.01)
+
+    # --- Link 1 (base rotation housing, vertical) ---
+    link1_path = f"{arm_root}/link1"
+    link1_cap = UsdGeom.Capsule.Define(stage, link1_path)
+    link1_cap.GetHeightAttr().Set(OM_LINK1_LENGTH)
+    link1_cap.GetRadiusAttr().Set(OM_LINK_RADIUS + 0.002)
+    link1_cap.GetAxisAttr().Set("Z")
+    link1_cap.GetDisplayColorAttr().Set([Gf.Vec3f(0.3, 0.3, 0.3)])
+    l1x = UsdGeom.Xformable(link1_cap)
+    l1x.ClearXformOpOrder()
+    l1x.AddTranslateOp().Set(Gf.Vec3d(dx, dy, mount_wz - L1H))
+    link1_prim = link1_cap.GetPrim()
+    UsdPhysics.RigidBodyAPI.Apply(link1_prim)
+    UsdPhysics.MassAPI.Apply(link1_prim).GetMassAttr().Set(OM_LINK1_MASS)
+
+    # --- Link 2 (upper arm) ---
+    link2_path = f"{arm_root}/link2"
+    link2_cap = UsdGeom.Capsule.Define(stage, link2_path)
+    link2_cap.GetHeightAttr().Set(OM_LINK2_LENGTH)
+    link2_cap.GetRadiusAttr().Set(OM_LINK_RADIUS)
+    link2_cap.GetAxisAttr().Set("Z")
+    link2_cap.GetDisplayColorAttr().Set([Gf.Vec3f(0.8, 0.2, 0.2)])
+    l2x = UsdGeom.Xformable(link2_cap)
+    l2x.ClearXformOpOrder()
+    l2x.AddTranslateOp().Set(Gf.Vec3d(dx, dy, mount_wz - OM_LINK1_LENGTH - L2H))
+    link2_prim = link2_cap.GetPrim()
+    UsdPhysics.RigidBodyAPI.Apply(link2_prim)
+    UsdPhysics.MassAPI.Apply(link2_prim).GetMassAttr().Set(OM_LINK2_MASS)
+
+    # --- Link 3 (forearm) ---
+    link3_path = f"{arm_root}/link3"
+    link3_cap = UsdGeom.Capsule.Define(stage, link3_path)
+    link3_cap.GetHeightAttr().Set(OM_LINK3_LENGTH)
+    link3_cap.GetRadiusAttr().Set(OM_LINK_RADIUS)
+    link3_cap.GetAxisAttr().Set("Z")
+    link3_cap.GetDisplayColorAttr().Set([Gf.Vec3f(0.2, 0.2, 0.8)])
+    l3x = UsdGeom.Xformable(link3_cap)
+    l3x.ClearXformOpOrder()
+    l3x.AddTranslateOp().Set(Gf.Vec3d(
+        dx, dy, mount_wz - OM_LINK1_LENGTH - OM_LINK2_LENGTH - L3H
+    ))
+    link3_prim = link3_cap.GetPrim()
+    UsdPhysics.RigidBodyAPI.Apply(link3_prim)
+    UsdPhysics.MassAPI.Apply(link3_prim).GetMassAttr().Set(OM_LINK3_MASS)
+
+    # --- Link 4 (wrist) ---
+    link4_path = f"{arm_root}/link4"
+    link4_cap = UsdGeom.Capsule.Define(stage, link4_path)
+    link4_cap.GetHeightAttr().Set(OM_LINK4_LENGTH)
+    link4_cap.GetRadiusAttr().Set(OM_LINK_RADIUS - 0.002)
+    link4_cap.GetAxisAttr().Set("Z")
+    link4_cap.GetDisplayColorAttr().Set([Gf.Vec3f(0.2, 0.7, 0.2)])
+    l4x = UsdGeom.Xformable(link4_cap)
+    l4x.ClearXformOpOrder()
+    l4x.AddTranslateOp().Set(Gf.Vec3d(
+        dx, dy,
+        mount_wz - OM_LINK1_LENGTH - OM_LINK2_LENGTH - OM_LINK3_LENGTH - L4H,
+    ))
+    link4_prim = link4_cap.GetPrim()
+    UsdPhysics.RigidBodyAPI.Apply(link4_prim)
+    UsdPhysics.MassAPI.Apply(link4_prim).GetMassAttr().Set(OM_LINK4_MASS)
+
+    # --- Gripper fingers ---
+    finger_z = (mount_wz - OM_LINK1_LENGTH - OM_LINK2_LENGTH
+                - OM_LINK3_LENGTH - OM_LINK4_LENGTH - FH)
+
+    left_finger_path = f"{arm_root}/finger_left"
+    lf_cap = UsdGeom.Capsule.Define(stage, left_finger_path)
+    lf_cap.GetHeightAttr().Set(OM_FINGER_LENGTH)
+    lf_cap.GetRadiusAttr().Set(OM_FINGER_RADIUS)
+    lf_cap.GetAxisAttr().Set("Z")
+    lf_cap.GetDisplayColorAttr().Set([Gf.Vec3f(0.7, 0.7, 0.2)])
+    lfx = UsdGeom.Xformable(lf_cap)
+    lfx.ClearXformOpOrder()
+    lfx.AddTranslateOp().Set(Gf.Vec3d(dx, dy + OM_FINGER_OFFSET_Y, finger_z))
+    lf_prim = lf_cap.GetPrim()
+    UsdPhysics.RigidBodyAPI.Apply(lf_prim)
+    UsdPhysics.MassAPI.Apply(lf_prim).GetMassAttr().Set(OM_FINGER_MASS)
+
+    right_finger_path = f"{arm_root}/finger_right"
+    rf_cap = UsdGeom.Capsule.Define(stage, right_finger_path)
+    rf_cap.GetHeightAttr().Set(OM_FINGER_LENGTH)
+    rf_cap.GetRadiusAttr().Set(OM_FINGER_RADIUS)
+    rf_cap.GetAxisAttr().Set("Z")
+    rf_cap.GetDisplayColorAttr().Set([Gf.Vec3f(0.7, 0.7, 0.2)])
+    rfx = UsdGeom.Xformable(rf_cap)
+    rfx.ClearXformOpOrder()
+    rfx.AddTranslateOp().Set(Gf.Vec3d(dx, dy - OM_FINGER_OFFSET_Y, finger_z))
+    rf_prim = rf_cap.GetPrim()
+    UsdPhysics.RigidBodyAPI.Apply(rf_prim)
+    UsdPhysics.MassAPI.Apply(rf_prim).GetMassAttr().Set(OM_FINGER_MASS)
+
+    sim_app.update()
+
+    # --- FixedJoint: drone body <-> arm base_link ---
+    attach_joint = UsdPhysics.FixedJoint.Define(
+        stage, Sdf.Path(f"{arm_root}/attach_to_body")
+    )
+    attach_joint.CreateBody0Rel().SetTargets([Sdf.Path(body_path)])
+    attach_joint.CreateBody1Rel().SetTargets([Sdf.Path(base_path)])
+    attach_joint.CreateLocalPos0Attr().Set(Gf.Vec3f(0.0, 0.0, OM_MOUNT_Z))
+    attach_joint.CreateLocalRot0Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+    attach_joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+    attach_joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+
+    # --- Joint 1: base yaw (revolute Z) ---
+    j1_path = f"{arm_root}/joint1"
+    j1 = UsdPhysics.RevoluteJoint.Define(stage, j1_path)
+    j1.GetAxisAttr().Set("Z")
+    j1.GetLowerLimitAttr().Set(-180.0)
+    j1.GetUpperLimitAttr().Set(180.0)
+    j1.GetBody0Rel().SetTargets([base_path])
+    j1.GetBody1Rel().SetTargets([link1_path])
+    j1.GetLocalPos0Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+    j1.GetLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, L1H))
+    j1.GetLocalRot0Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+    j1.GetLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+    j1_drive = UsdPhysics.DriveAPI.Apply(j1.GetPrim(), "angular")
+    j1_drive.GetTypeAttr().Set("force")
+    j1_drive.GetStiffnessAttr().Set(OM_JOINT_STIFFNESS)
+    j1_drive.GetDampingAttr().Set(OM_JOINT_DAMPING)
+    j1_drive.GetTargetPositionAttr().Set(0.0)
+
+    # --- Joint 2: shoulder pitch (revolute Y) ---
+    j2_path = f"{arm_root}/joint2"
+    j2 = UsdPhysics.RevoluteJoint.Define(stage, j2_path)
+    j2.GetAxisAttr().Set("Y")
+    j2.GetLowerLimitAttr().Set(-85.9)
+    j2.GetUpperLimitAttr().Set(85.9)
+    j2.GetBody0Rel().SetTargets([link1_path])
+    j2.GetBody1Rel().SetTargets([link2_path])
+    j2.GetLocalPos0Attr().Set(Gf.Vec3f(0.0, 0.0, -L1H))
+    j2.GetLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, L2H))
+    j2.GetLocalRot0Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+    j2.GetLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+    j2_drive = UsdPhysics.DriveAPI.Apply(j2.GetPrim(), "angular")
+    j2_drive.GetTypeAttr().Set("force")
+    j2_drive.GetStiffnessAttr().Set(OM_JOINT_STIFFNESS)
+    j2_drive.GetDampingAttr().Set(OM_JOINT_DAMPING)
+    j2_drive.GetTargetPositionAttr().Set(0.0)  # straight down at rest
+
+    # --- Joint 3: elbow pitch (revolute Y) ---
+    j3_path = f"{arm_root}/joint3"
+    j3 = UsdPhysics.RevoluteJoint.Define(stage, j3_path)
+    j3.GetAxisAttr().Set("Y")
+    j3.GetLowerLimitAttr().Set(-85.9)
+    j3.GetUpperLimitAttr().Set(80.2)
+    j3.GetBody0Rel().SetTargets([link2_path])
+    j3.GetBody1Rel().SetTargets([link3_path])
+    j3.GetLocalPos0Attr().Set(Gf.Vec3f(0.0, 0.0, -L2H))
+    j3.GetLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, L3H))
+    j3.GetLocalRot0Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+    j3.GetLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+    j3_drive = UsdPhysics.DriveAPI.Apply(j3.GetPrim(), "angular")
+    j3_drive.GetTypeAttr().Set("force")
+    j3_drive.GetStiffnessAttr().Set(OM_JOINT_STIFFNESS)
+    j3_drive.GetDampingAttr().Set(OM_JOINT_DAMPING)
+    j3_drive.GetTargetPositionAttr().Set(0.0)  # straight down at rest
+
+    # --- Joint 4: wrist pitch (revolute Y) ---
+    j4_path = f"{arm_root}/joint4"
+    j4 = UsdPhysics.RevoluteJoint.Define(stage, j4_path)
+    j4.GetAxisAttr().Set("Y")
+    j4.GetLowerLimitAttr().Set(-97.4)
+    j4.GetUpperLimitAttr().Set(112.9)
+    j4.GetBody0Rel().SetTargets([link3_path])
+    j4.GetBody1Rel().SetTargets([link4_path])
+    j4.GetLocalPos0Attr().Set(Gf.Vec3f(0.0, 0.0, -L3H))
+    j4.GetLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, L4H))
+    j4.GetLocalRot0Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+    j4.GetLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+    j4_drive = UsdPhysics.DriveAPI.Apply(j4.GetPrim(), "angular")
+    j4_drive.GetTypeAttr().Set("force")
+    j4_drive.GetStiffnessAttr().Set(OM_JOINT_STIFFNESS)
+    j4_drive.GetDampingAttr().Set(OM_JOINT_DAMPING)
+    j4_drive.GetTargetPositionAttr().Set(0.0)
+
+    # --- Gripper left finger (prismatic Y) ---
+    gl_path = f"{arm_root}/gripper_left_joint"
+    gl = UsdPhysics.PrismaticJoint.Define(stage, gl_path)
+    gl.GetAxisAttr().Set("Y")
+    gl.GetLowerLimitAttr().Set(-0.010)
+    gl.GetUpperLimitAttr().Set(0.019)
+    gl.GetBody0Rel().SetTargets([link4_path])
+    gl.GetBody1Rel().SetTargets([left_finger_path])
+    gl.GetLocalPos0Attr().Set(Gf.Vec3f(0.0, OM_FINGER_OFFSET_Y, -L4H))
+    gl.GetLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, FH))
+    gl.GetLocalRot0Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+    gl.GetLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+    gl_drive = UsdPhysics.DriveAPI.Apply(gl.GetPrim(), "linear")
+    gl_drive.GetTypeAttr().Set("force")
+    gl_drive.GetStiffnessAttr().Set(OM_GRIPPER_STIFFNESS)
+    gl_drive.GetDampingAttr().Set(OM_GRIPPER_DAMPING)
+    gl_drive.GetTargetPositionAttr().Set(0.0)
+
+    # --- Gripper right finger (prismatic Y, mimic of left) ---
+    gr_path = f"{arm_root}/gripper_right_joint"
+    gr = UsdPhysics.PrismaticJoint.Define(stage, gr_path)
+    gr.GetAxisAttr().Set("Y")
+    gr.GetLowerLimitAttr().Set(-0.019)
+    gr.GetUpperLimitAttr().Set(0.010)
+    gr.GetBody0Rel().SetTargets([link4_path])
+    gr.GetBody1Rel().SetTargets([right_finger_path])
+    gr.GetLocalPos0Attr().Set(Gf.Vec3f(0.0, -OM_FINGER_OFFSET_Y, -L4H))
+    gr.GetLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, FH))
+    gr.GetLocalRot0Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+    gr.GetLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+    gr_drive = UsdPhysics.DriveAPI.Apply(gr.GetPrim(), "linear")
+    gr_drive.GetTypeAttr().Set("force")
+    gr_drive.GetStiffnessAttr().Set(OM_GRIPPER_STIFFNESS)
+    gr_drive.GetDampingAttr().Set(OM_GRIPPER_DAMPING)
+    gr_drive.GetTargetPositionAttr().Set(0.0)
+
+    sim_app.update()
+    print(f"  drone{drone_id}: 5-DOF OpenMANIPULATOR-X arm created (folded)")
+
+    # Build drive dictionaries
+    arm_drives = {
+        "joint1": UsdPhysics.DriveAPI.Get(stage.GetPrimAtPath(j1_path), "angular"),
+        "joint2": UsdPhysics.DriveAPI.Get(stage.GetPrimAtPath(j2_path), "angular"),
+        "joint3": UsdPhysics.DriveAPI.Get(stage.GetPrimAtPath(j3_path), "angular"),
+        "joint4": UsdPhysics.DriveAPI.Get(stage.GetPrimAtPath(j4_path), "angular"),
+        "gripper": UsdPhysics.DriveAPI.Get(stage.GetPrimAtPath(gl_path), "linear"),
+    }
+    # Right finger mimics left with multiplier=-1
+    mimic_drives = {
+        "gripper": [(
+            UsdPhysics.DriveAPI.Get(stage.GetPrimAtPath(gr_path), "linear"),
+            -1.0,
+        )],
+    }
+
+    return {
+        "arm_drives": arm_drives,
+        "linear_joints": {"gripper"},
+        "mimic_drives": mimic_drives,
+    }
+
+
 class ArmBridgeNode(RclpyNode):
     """Per-drone ROS2 node for arm joint command/state bridging."""
 
-    def __init__(self, drone_id, arm_drives):
+    def __init__(self, drone_id, arm_drives, linear_joints=None, mimic_drives=None):
         super().__init__(f"drone{drone_id}_arm_bridge")
         self.arm_drives = arm_drives
+        self.linear_joints = linear_joints or set()
+        self.mimic_drives = mimic_drives or {}  # {name: [(drive, multiplier), ...]}
         self.cmd_lock = threading.Lock()
         self.cmd_targets = {}
 
@@ -396,15 +728,21 @@ class ArmBridgeNode(RclpyNode):
         with self.cmd_lock:
             for i, name in enumerate(msg.name):
                 if name in self.arm_drives and i < len(msg.position):
-                    self.cmd_targets[name] = math.degrees(msg.position[i])
+                    if name in self.linear_joints:
+                        self.cmd_targets[name] = msg.position[i]  # meters
+                    else:
+                        self.cmd_targets[name] = math.degrees(msg.position[i])
 
     def apply_commands(self):
         """Apply pending joint commands to USD drives. Call from sim loop."""
         with self.cmd_lock:
-            for name, target_deg in self.cmd_targets.items():
+            for name, target in self.cmd_targets.items():
                 drive = self.arm_drives.get(name)
                 if drive:
-                    drive.GetTargetPositionAttr().Set(float(target_deg))
+                    drive.GetTargetPositionAttr().Set(float(target))
+                # Apply mimic drives (e.g. right gripper finger mirrors left)
+                for mimic_drive, mult in self.mimic_drives.get(name, []):
+                    mimic_drive.GetTargetPositionAttr().Set(float(target * mult))
             self.cmd_targets.clear()
 
     def publish_states(self, stamp_sec):
@@ -415,7 +753,12 @@ class ArmBridgeNode(RclpyNode):
         msg.position = []
         for name, drive in self.arm_drives.items():
             target = drive.GetTargetPositionAttr().Get()
-            msg.position.append(math.radians(target if target else 0.0))
+            if target is None:
+                target = 0.0
+            if name in self.linear_joints:
+                msg.position.append(float(target))  # meters
+            else:
+                msg.position.append(math.radians(target))
         self.pub.publish(msg)
 
 
