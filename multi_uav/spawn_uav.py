@@ -31,7 +31,7 @@ CAMERA_UP = 0.05              # 5 cm above body centre
 
 # Landing leg constants
 LEG_LENGTH = 0.20             # 20 cm (2-DOF arm version)
-LEG_LENGTH_5DOF = 0.55        # 55 cm (5-DOF arm version – clears straight-down arm)
+LEG_LENGTH_5DOF = 0.30        # 30 cm (5-DOF arm version – arm folds at elbow)
 LEG_RADIUS = 0.005            # 5 mm
 ROTOR_POSITIONS = {
     "leg_front_right": (0.13, -0.22),
@@ -64,6 +64,7 @@ OM_JOINT_STIFFNESS = 1e5
 OM_JOINT_DAMPING = 1e4
 OM_GRIPPER_STIFFNESS = 1e4
 OM_GRIPPER_DAMPING = 1e3
+OM_J3_FOLD_DEG = -85.0        # Elbow fold target (degrees) – negative = fold forward (+X)
 # Link masses from URDF (kg)
 OM_LINK1_MASS = 0.079
 OM_LINK2_MASS = 0.098
@@ -481,7 +482,10 @@ def create_5dof_arm(stage, drone_cfg, spawn_height, sim_app):
     UsdPhysics.RigidBodyAPI.Apply(link1_prim)
     UsdPhysics.MassAPI.Apply(link1_prim).GetMassAttr().Set(OM_LINK1_MASS)
 
-    # --- Link 2 (upper arm) ---
+    # J2 pivot world-Z (bottom of link1)
+    j2_wz = mount_wz - OM_LINK1_LENGTH
+
+    # --- Link 2 (upper arm, hangs straight down – J2 stays at 0°) ---
     link2_path = f"{arm_root}/link2"
     link2_cap = UsdGeom.Capsule.Define(stage, link2_path)
     link2_cap.GetHeightAttr().Set(OM_LINK2_LENGTH)
@@ -490,12 +494,22 @@ def create_5dof_arm(stage, drone_cfg, spawn_height, sim_app):
     link2_cap.GetDisplayColorAttr().Set([Gf.Vec3f(0.8, 0.2, 0.2)])
     l2x = UsdGeom.Xformable(link2_cap)
     l2x.ClearXformOpOrder()
-    l2x.AddTranslateOp().Set(Gf.Vec3d(dx, dy, mount_wz - OM_LINK1_LENGTH - L2H))
+    l2x.AddTranslateOp().Set(Gf.Vec3d(dx, dy, j2_wz - L2H))
     link2_prim = link2_cap.GetPrim()
     UsdPhysics.RigidBodyAPI.Apply(link2_prim)
     UsdPhysics.MassAPI.Apply(link2_prim).GetMassAttr().Set(OM_LINK2_MASS)
 
-    # --- Link 3 (forearm) ---
+    # --- Forward kinematics for J3 fold (elbow folds forward) ---
+    # J3 pivot (bottom of link2, J2=0 so straight down)
+    j3_wz = j2_wz - OM_LINK2_LENGTH
+    # J3 world rotation (cumulative: J2=0 + J3=fold)
+    _j3_rad = math.radians(OM_J3_FOLD_DEG)
+    _j3_sin = math.sin(_j3_rad)
+    _j3_cos = math.cos(_j3_rad)
+    # Link translate = joint_parent_pos - R_y(rot) * (0, 0, half_len)
+    # R_y(θ) * (0,0,h) = (h*sinθ, 0, h*cosθ)
+
+    # --- Link 3 (forearm, folded at J3) ---
     link3_path = f"{arm_root}/link3"
     link3_cap = UsdGeom.Capsule.Define(stage, link3_path)
     link3_cap.GetHeightAttr().Set(OM_LINK3_LENGTH)
@@ -505,13 +519,18 @@ def create_5dof_arm(stage, drone_cfg, spawn_height, sim_app):
     l3x = UsdGeom.Xformable(link3_cap)
     l3x.ClearXformOpOrder()
     l3x.AddTranslateOp().Set(Gf.Vec3d(
-        dx, dy, mount_wz - OM_LINK1_LENGTH - OM_LINK2_LENGTH - L3H
+        dx - L3H * _j3_sin, dy, j3_wz - L3H * _j3_cos
     ))
+    l3x.AddRotateXYZOp().Set(Gf.Vec3f(0, OM_J3_FOLD_DEG, 0))
     link3_prim = link3_cap.GetPrim()
     UsdPhysics.RigidBodyAPI.Apply(link3_prim)
     UsdPhysics.MassAPI.Apply(link3_prim).GetMassAttr().Set(OM_LINK3_MASS)
 
-    # --- Link 4 (wrist) ---
+    # J4 pivot (bottom of link3)
+    j4_wx = dx - OM_LINK3_LENGTH * _j3_sin
+    j4_wz = j3_wz - OM_LINK3_LENGTH * _j3_cos
+
+    # --- Link 4 (wrist, J4=0° so same world rotation as link3) ---
     link4_path = f"{arm_root}/link4"
     link4_cap = UsdGeom.Capsule.Define(stage, link4_path)
     link4_cap.GetHeightAttr().Set(OM_LINK4_LENGTH)
@@ -521,16 +540,20 @@ def create_5dof_arm(stage, drone_cfg, spawn_height, sim_app):
     l4x = UsdGeom.Xformable(link4_cap)
     l4x.ClearXformOpOrder()
     l4x.AddTranslateOp().Set(Gf.Vec3d(
-        dx, dy,
-        mount_wz - OM_LINK1_LENGTH - OM_LINK2_LENGTH - OM_LINK3_LENGTH - L4H,
+        j4_wx - L4H * _j3_sin, dy, j4_wz - L4H * _j3_cos,
     ))
+    l4x.AddRotateXYZOp().Set(Gf.Vec3f(0, OM_J3_FOLD_DEG, 0))
     link4_prim = link4_cap.GetPrim()
     UsdPhysics.RigidBodyAPI.Apply(link4_prim)
     UsdPhysics.MassAPI.Apply(link4_prim).GetMassAttr().Set(OM_LINK4_MASS)
 
-    # --- Gripper fingers ---
-    finger_z = (mount_wz - OM_LINK1_LENGTH - OM_LINK2_LENGTH
-                - OM_LINK3_LENGTH - OM_LINK4_LENGTH - FH)
+    # Gripper base (bottom of link4)
+    g_wx = j4_wx - OM_LINK4_LENGTH * _j3_sin
+    g_wz = j4_wz - OM_LINK4_LENGTH * _j3_cos
+
+    # --- Gripper fingers (same rotation as link4) ---
+    finger_tx = g_wx - FH * _j3_sin
+    finger_tz = g_wz - FH * _j3_cos
 
     left_finger_path = f"{arm_root}/finger_left"
     lf_cap = UsdGeom.Capsule.Define(stage, left_finger_path)
@@ -540,7 +563,8 @@ def create_5dof_arm(stage, drone_cfg, spawn_height, sim_app):
     lf_cap.GetDisplayColorAttr().Set([Gf.Vec3f(0.7, 0.7, 0.2)])
     lfx = UsdGeom.Xformable(lf_cap)
     lfx.ClearXformOpOrder()
-    lfx.AddTranslateOp().Set(Gf.Vec3d(dx, dy + OM_FINGER_OFFSET_Y, finger_z))
+    lfx.AddTranslateOp().Set(Gf.Vec3d(finger_tx, dy + OM_FINGER_OFFSET_Y, finger_tz))
+    lfx.AddRotateXYZOp().Set(Gf.Vec3f(0, OM_J3_FOLD_DEG, 0))
     lf_prim = lf_cap.GetPrim()
     UsdPhysics.RigidBodyAPI.Apply(lf_prim)
     UsdPhysics.MassAPI.Apply(lf_prim).GetMassAttr().Set(OM_FINGER_MASS)
@@ -553,7 +577,8 @@ def create_5dof_arm(stage, drone_cfg, spawn_height, sim_app):
     rf_cap.GetDisplayColorAttr().Set([Gf.Vec3f(0.7, 0.7, 0.2)])
     rfx = UsdGeom.Xformable(rf_cap)
     rfx.ClearXformOpOrder()
-    rfx.AddTranslateOp().Set(Gf.Vec3d(dx, dy - OM_FINGER_OFFSET_Y, finger_z))
+    rfx.AddTranslateOp().Set(Gf.Vec3d(finger_tx, dy - OM_FINGER_OFFSET_Y, finger_tz))
+    rfx.AddRotateXYZOp().Set(Gf.Vec3f(0, OM_J3_FOLD_DEG, 0))
     rf_prim = rf_cap.GetPrim()
     UsdPhysics.RigidBodyAPI.Apply(rf_prim)
     UsdPhysics.MassAPI.Apply(rf_prim).GetMassAttr().Set(OM_FINGER_MASS)
@@ -623,7 +648,7 @@ def create_5dof_arm(stage, drone_cfg, spawn_height, sim_app):
     j3_drive.GetTypeAttr().Set("force")
     j3_drive.GetStiffnessAttr().Set(OM_JOINT_STIFFNESS)
     j3_drive.GetDampingAttr().Set(OM_JOINT_DAMPING)
-    j3_drive.GetTargetPositionAttr().Set(0.0)  # straight down at rest
+    j3_drive.GetTargetPositionAttr().Set(OM_J3_FOLD_DEG)  # fold forward
 
     # --- Joint 4: wrist pitch (revolute Y) ---
     j4_path = f"{arm_root}/joint4"
@@ -680,7 +705,7 @@ def create_5dof_arm(stage, drone_cfg, spawn_height, sim_app):
     gr_drive.GetTargetPositionAttr().Set(0.0)
 
     sim_app.update()
-    print(f"  drone{drone_id}: 5-DOF OpenMANIPULATOR-X arm created (folded)")
+    print(f"  drone{drone_id}: 5-DOF OpenMANIPULATOR-X arm created (J3 folded at {OM_J3_FOLD_DEG}°)")
 
     # Build drive dictionaries
     arm_drives = {
