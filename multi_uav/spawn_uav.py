@@ -8,7 +8,7 @@ import ctypes
 import numpy as np
 import carb
 from scipy.spatial.transform import Rotation
-from pxr import UsdGeom, UsdPhysics, Gf, Sdf
+from pxr import UsdGeom, UsdPhysics, PhysxSchema, Gf, Sdf
 from omni.isaac.core.utils.prims import create_prim
 
 from pegasus.simulator.logic.backends.px4_mavlink_backend import (
@@ -85,6 +85,7 @@ def spawn_uav(stage, world, drone_cfg, spawn_height, assets_dir, sim_app):
         "px4_autolaunch": drone_cfg.get("px4_autolaunch", True),
         "px4_dir": pg.px4_path,
         "px4_vehicle_model": pg.px4_default_airframe,
+        "enable_lockstep": True,
     }
     if "px4_sim_port" in drone_cfg:
         px4_params["px4_sim_port"] = drone_cfg["px4_sim_port"]
@@ -128,8 +129,8 @@ def create_stereo_cameras(stage, drone_cfg, spawn_height, sim_app):
     """
     Creates stereo camera prims on a drone. Must be called AFTER world.reset().
 
-    Cameras are mounted via FixedJoint (same pattern as the arm) so they
-    follow the drone body during physics simulation.
+    Cameras are children of the drone body prim so they follow it via
+    USD hierarchy — no separate rigid bodies or joints needed.
 
     Args:
         stage: USD stage
@@ -149,49 +150,20 @@ def create_stereo_cameras(stage, drone_cfg, spawn_height, sim_app):
     half_baseline = STEREO_BASELINE / 2.0
     stereo_cam_paths = {}
 
-    dx = drone_cfg.get("x", 0.0)
-    dy = drone_cfg.get("y", 0.0)
-    yaw = drone_cfg.get("yaw", 0.0)
-    yaw_rot = Rotation.from_euler("Z", yaw, degrees=True)
-
     # Camera orientation: scipy [x,y,z,w] -> Gf.Quatf(w,x,y,z)
     cam_q = CAM_QUAT
     cam_quat_gf = Gf.Quatf(float(cam_q[3]), float(cam_q[0]), float(cam_q[1]), float(cam_q[2]))
 
-    cam_root = f"{prefix}/stereo_cameras"
-    UsdGeom.Xform.Define(stage, cam_root)
-
     for side, y_offset in [("left", half_baseline), ("right", -half_baseline)]:
-        # --- Rigid-body mount (follows drone body via FixedJoint) ---
-        mount_path = f"{cam_root}/mount_{side}"
+        # Mount as child of body — inherits body transform automatically
+        mount_path = f"{body_path}/stereo_{side}"
         mount_xform = UsdGeom.Xform.Define(stage, mount_path)
-
-        # Initial world position (so physics starts from correct pose)
-        local_pos = np.array([CAMERA_FORWARD, y_offset, CAMERA_UP])
-        world_offset = yaw_rot.apply(local_pos)
         mx = UsdGeom.Xformable(mount_xform)
         mx.ClearXformOpOrder()
-        mx.AddTranslateOp().Set(Gf.Vec3d(
-            dx + world_offset[0], dy + world_offset[1], spawn_height + world_offset[2]
-        ))
+        # Local offset relative to body (body-frame coordinates, no yaw needed)
+        mx.AddTranslateOp().Set(Gf.Vec3d(CAMERA_FORWARD, y_offset, CAMERA_UP))
 
-        mount_prim = mount_xform.GetPrim()
-        UsdPhysics.RigidBodyAPI.Apply(mount_prim)
-        mass_api = UsdPhysics.MassAPI.Apply(mount_prim)
-        mass_api.GetMassAttr().Set(0.001)
-
-        # FixedJoint: drone body <-> camera mount (position only, no rotation)
-        joint = UsdPhysics.FixedJoint.Define(stage, Sdf.Path(f"{mount_path}/attach"))
-        joint.CreateBody0Rel().SetTargets([Sdf.Path(body_path)])
-        joint.CreateBody1Rel().SetTargets([Sdf.Path(mount_path)])
-        joint.CreateLocalPos0Attr().Set(
-            Gf.Vec3f(CAMERA_FORWARD, y_offset, CAMERA_UP)
-        )
-        joint.CreateLocalRot0Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
-        joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
-        joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
-
-        # --- Camera prim (child of mount, with camera orientation) ---
+        # Camera prim with optical-frame orientation
         cam_path = f"{mount_path}/camera"
         cam_prim = stage.DefinePrim(cam_path, "Camera")
         cam_xf = UsdGeom.Xformable(cam_prim)
@@ -224,6 +196,8 @@ def create_arm(stage, drone_cfg, spawn_height, sim_app):
     body_path = f"{prefix}/quadrotor/body"
     dx = drone_cfg.get("x", 0.0)
     dy = drone_cfg.get("y", 0.0)
+    yaw = drone_cfg.get("yaw", 0.0)
+    yaw_rot = Rotation.from_euler("Z", yaw, degrees=True)
 
     # --- Landing legs ---
     leg_z = -LEG_LENGTH / 2.0
@@ -250,24 +224,19 @@ def create_arm(stage, drone_cfg, spawn_height, sim_app):
         return {"arm_drives": None, "shoulder_path": None, "elbow_path": None}
 
     arm_root = f"{prefix}/folding_arm"
-    mount_wx = dx
-    mount_wy = dy
     mount_wz = spawn_height + SHOULDER_MOUNT_Z
 
     UsdGeom.Xform.Define(stage, arm_root)
 
-    # Base link
-    base_path = f"{arm_root}/base_link"
-    base_xform = UsdGeom.Xform.Define(stage, base_path)
-    bx = UsdGeom.Xformable(base_xform)
-    bx.ClearXformOpOrder()
-    bx.AddTranslateOp().Set(Gf.Vec3d(mount_wx, mount_wy, mount_wz))
-    base_prim = base_xform.GetPrim()
-    UsdPhysics.RigidBodyAPI.Apply(base_prim)
-    mass_base = UsdPhysics.MassAPI.Apply(base_prim)
-    mass_base.GetMassAttr().Set(0.01)
+    # Arm starts at shoulder angle=-90° (deployed forward).
+    # Positions and orientations are yaw-aware so the initial joint angle
+    # matches the drive target exactly — no correction needed.
+    upper_local = np.array([ARM_HALF_LEN, 0.0, 0.0])
+    upper_world = yaw_rot.apply(upper_local)
+    upper_orient = yaw_rot * Rotation.from_quat([0.0, -0.7071068, 0.0, 0.7071068])
+    uq = upper_orient.as_quat()
+    upper_quat_gf = Gf.Quatf(float(uq[3]), float(uq[0]), float(uq[1]), float(uq[2]))
 
-    # Upper link
     upper_path = f"{arm_root}/upper_link"
     upper_capsule = UsdGeom.Capsule.Define(stage, upper_path)
     upper_capsule.GetHeightAttr().Set(ARM_LINK_LENGTH)
@@ -277,15 +246,22 @@ def create_arm(stage, drone_cfg, spawn_height, sim_app):
 
     ux = UsdGeom.Xformable(upper_capsule)
     ux.ClearXformOpOrder()
-    ux.AddTranslateOp().Set(Gf.Vec3d(mount_wx + ARM_HALF_LEN, mount_wy, mount_wz))
-    ux.AddOrientOp().Set(Gf.Quatf(0.7071, 0.0, -0.7071, 0.0))
+    ux.AddTranslateOp().Set(Gf.Vec3d(
+        dx + upper_world[0], dy + upper_world[1], mount_wz + upper_world[2]
+    ))
+    ux.AddOrientOp().Set(upper_quat_gf)
 
     upper_prim = upper_capsule.GetPrim()
     UsdPhysics.RigidBodyAPI.Apply(upper_prim)
+    PhysxSchema.PhysxRigidBodyAPI.Apply(upper_prim).GetSleepThresholdAttr().Set(0.0)
     mass_upper = UsdPhysics.MassAPI.Apply(upper_prim)
     mass_upper.GetMassAttr().Set(ARM_LINK_MASS)
 
-    # Lower link
+    # Lower link — folded back on upper (elbow=180°)
+    lower_orient = yaw_rot * Rotation.from_quat([0.0, 0.7071068, 0.0, 0.7071068])
+    lq = lower_orient.as_quat()
+    lower_quat_gf = Gf.Quatf(float(lq[3]), float(lq[0]), float(lq[1]), float(lq[2]))
+
     lower_path = f"{arm_root}/lower_link"
     lower_capsule = UsdGeom.Capsule.Define(stage, lower_path)
     lower_capsule.GetHeightAttr().Set(ARM_LINK_LENGTH)
@@ -295,38 +271,28 @@ def create_arm(stage, drone_cfg, spawn_height, sim_app):
 
     lx = UsdGeom.Xformable(lower_capsule)
     lx.ClearXformOpOrder()
-    lx.AddTranslateOp().Set(
-        Gf.Vec3d(mount_wx + ARM_HALF_LEN, mount_wy, mount_wz - 2 * ARM_LINK_RADIUS)
-    )
-    lx.AddOrientOp().Set(Gf.Quatf(0.7071, 0.0, 0.7071, 0.0))
+    lx.AddTranslateOp().Set(Gf.Vec3d(
+        dx + upper_world[0], dy + upper_world[1], mount_wz + upper_world[2] - 2 * ARM_LINK_RADIUS
+    ))
+    lx.AddOrientOp().Set(lower_quat_gf)
 
     lower_prim = lower_capsule.GetPrim()
     UsdPhysics.RigidBodyAPI.Apply(lower_prim)
+    PhysxSchema.PhysxRigidBodyAPI.Apply(lower_prim).GetSleepThresholdAttr().Set(0.0)
     mass_lower = UsdPhysics.MassAPI.Apply(lower_prim)
     mass_lower.GetMassAttr().Set(ARM_LINK_MASS)
 
     sim_app.update()
 
-    # FixedJoint: drone body <-> arm base_link
-    attach_joint = UsdPhysics.FixedJoint.Define(
-        stage, Sdf.Path(f"{arm_root}/attach_to_body")
-    )
-    attach_joint.CreateBody0Rel().SetTargets([Sdf.Path(body_path)])
-    attach_joint.CreateBody1Rel().SetTargets([Sdf.Path(base_path)])
-    attach_joint.CreateLocalPos0Attr().Set(Gf.Vec3f(0.0, 0.0, SHOULDER_MOUNT_Z))
-    attach_joint.CreateLocalRot0Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
-    attach_joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
-    attach_joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
-
-    # Shoulder revolute joint
+    # Shoulder revolute joint — connects directly to drone body
     shoulder_path = f"{arm_root}/shoulder_joint"
     shoulder_joint = UsdPhysics.RevoluteJoint.Define(stage, shoulder_path)
     shoulder_joint.GetAxisAttr().Set("Y")
     shoulder_joint.GetLowerLimitAttr().Set(-90.0)
     shoulder_joint.GetUpperLimitAttr().Set(90.0)
-    shoulder_joint.GetBody0Rel().SetTargets([base_path])
+    shoulder_joint.GetBody0Rel().SetTargets([body_path])
     shoulder_joint.GetBody1Rel().SetTargets([upper_path])
-    shoulder_joint.GetLocalPos0Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+    shoulder_joint.GetLocalPos0Attr().Set(Gf.Vec3f(0.0, 0.0, SHOULDER_MOUNT_Z))
     shoulder_joint.GetLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, ARM_HALF_LEN))
     shoulder_joint.GetLocalRot0Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
     shoulder_joint.GetLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
@@ -357,7 +323,7 @@ def create_arm(stage, drone_cfg, spawn_height, sim_app):
     elbow_drive.GetTargetPositionAttr().Set(180.0)
 
     sim_app.update()
-    print(f"  drone{drone_id}: 2-DOF arm created (folded)")
+    print(f"  drone{drone_id}: 2-DOF arm created")
 
     arm_drives = {
         "shoulder_joint": UsdPhysics.DriveAPI.Get(
@@ -378,11 +344,13 @@ def create_arm(stage, drone_cfg, spawn_height, sim_app):
 class ArmBridgeNode(RclpyNode):
     """Per-drone ROS2 node for arm joint command/state bridging."""
 
-    def __init__(self, drone_id, arm_drives):
+    def __init__(self, drone_id, arm_drives, initial_targets=None):
         super().__init__(f"drone{drone_id}_arm_bridge")
+        self.drone_id = drone_id
         self.arm_drives = arm_drives
         self.cmd_lock = threading.Lock()
-        self.cmd_targets = {}
+        # Pre-populate with initial targets so they get applied during first physics step
+        self.cmd_targets = dict(initial_targets) if initial_targets else {}
 
         prefix = f"drone{drone_id}"
         self.sub = self.create_subscription(
@@ -399,13 +367,13 @@ class ArmBridgeNode(RclpyNode):
                     self.cmd_targets[name] = math.degrees(msg.position[i])
 
     def apply_commands(self):
-        """Apply pending joint commands to USD drives. Call from sim loop."""
+        """Apply joint targets to USD drives. Call from sim loop.
+        Targets persist until overridden by a new ROS2 command."""
         with self.cmd_lock:
             for name, target_deg in self.cmd_targets.items():
                 drive = self.arm_drives.get(name)
                 if drive:
                     drive.GetTargetPositionAttr().Set(float(target_deg))
-            self.cmd_targets.clear()
 
     def publish_states(self, stamp_sec):
         msg = JointState()

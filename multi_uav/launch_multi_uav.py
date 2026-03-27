@@ -115,29 +115,44 @@ def main():
 
     stage = omni.usd.get_context().get_stage()
 
-    # --- Phase 1: Spawn all Multirotors (before world.reset()) ---
-    print("Spawning drones...")
+    # --- Phase 1: Spawn all Multirotors + arms (before world.reset()) ---
+    print("Spawning drones with arms...")
     drone_handles = []
     for dcfg in drones_cfg:
         handle = spawn_uav(stage, world, dcfg, spawn_height, assets_dir, simulation_app)
+        # Create arm immediately so PhysX initializes drives during world.reset()
+        arm_result = create_arm(stage, dcfg, spawn_height, simulation_app)
+        handle.update(arm_result)
         drone_handles.append(handle)
         time.sleep(0.5)
 
-    # --- world.reset() ---
+    # --- world.reset() — PhysX initializes ALL bodies, joints, and drives ---
     print("Resetting world...")
     world.reset()
     stage = omni.usd.get_context().get_stage()
 
-    # --- Phase 2: Create cameras, legs + arms (after world.reset()) ---
+    # --- Increase PhysX solver iterations (must be AFTER world.reset()) ---
+    from pxr import UsdPhysics, PhysxSchema
+    physics_scene_prim = None
+    for prim in stage.Traverse():
+        if prim.GetTypeName() == "PhysicsScene":
+            physics_scene_prim = prim
+            break
+    if physics_scene_prim is not None:
+        physx_scene = PhysxSchema.PhysxSceneAPI.Apply(physics_scene_prim)
+        physx_scene.GetMinPositionIterationCountAttr().Set(32)
+        physx_scene.GetMaxPositionIterationCountAttr().Set(64)
+        physx_scene.GetMinVelocityIterationCountAttr().Set(16)
+        physx_scene.GetMaxVelocityIterationCountAttr().Set(32)
+        print(f"  PhysX solver iterations set (pos: 32-64, vel: 16-32)")
+    else:
+        print("  WARNING: PhysicsScene not found — solver iterations not tuned")
+
+    # --- Phase 2: Create cameras (after world.reset(), no physics needed) ---
     print("Creating stereo cameras...")
     for i, dcfg in enumerate(drones_cfg):
         cam_paths = create_stereo_cameras(stage, dcfg, spawn_height, simulation_app)
         drone_handles[i]["stereo_cam_paths"] = cam_paths
-
-    print("Creating legs and arms...")
-    for i, dcfg in enumerate(drones_cfg):
-        arm_result = create_arm(stage, dcfg, spawn_height, simulation_app)
-        drone_handles[i].update(arm_result)
 
     # --- ROS2 setup ---
     print("Setting up ROS2...")
@@ -165,7 +180,10 @@ def main():
 
         # Arm bridge
         if handle.get("arm_drives"):
-            bridge = ArmBridgeNode(did, handle["arm_drives"])
+            bridge = ArmBridgeNode(did, handle["arm_drives"], initial_targets={
+                "shoulder_joint": -90.0,
+                "elbow_joint": 180.0,
+            })
             executor.add_node(bridge)
             arm_bridges.append(bridge)
             handle["arm_bridge"] = bridge
@@ -185,6 +203,37 @@ def main():
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
     spin_thread.start()
     print("  ROS2 executor spinning\n")
+
+    # --- Re-apply ALL drive settings (last drone's drives may not be fully registered) ---
+    print("Re-applying arm drive settings...")
+    from pxr import UsdPhysics as _UsdPhys
+    from spawn_uav import JOINT_STIFFNESS, JOINT_DAMPING
+    for handle in drone_handles:
+        did = handle["drone_id"]
+        if handle.get("shoulder_path") and handle.get("elbow_path"):
+            sh_prim = stage.GetPrimAtPath(handle["shoulder_path"])
+            el_prim = stage.GetPrimAtPath(handle["elbow_path"])
+
+            # Re-apply shoulder drive from scratch
+            sh_drive = _UsdPhys.DriveAPI.Apply(sh_prim, "angular")
+            sh_drive.GetTypeAttr().Set("force")
+            sh_drive.GetStiffnessAttr().Set(JOINT_STIFFNESS)
+            sh_drive.GetDampingAttr().Set(JOINT_DAMPING)
+            sh_drive.GetTargetPositionAttr().Set(-90.0)
+
+            # Re-apply elbow drive from scratch
+            el_drive = _UsdPhys.DriveAPI.Apply(el_prim, "angular")
+            el_drive.GetTypeAttr().Set("force")
+            el_drive.GetStiffnessAttr().Set(JOINT_STIFFNESS)
+            el_drive.GetDampingAttr().Set(JOINT_DAMPING)
+            el_drive.GetTargetPositionAttr().Set(180.0)
+
+            print(f"  drone{did}: drives re-applied (shoulder=-90, elbow=180)")
+
+            # Refresh the drive handles stored in arm_drives
+            handle["arm_drives"]["shoulder_joint"] = sh_drive
+            handle["arm_drives"]["elbow_joint"] = el_drive
+    simulation_app.update()
 
     # --- Timeline ---
     timeline = omni.timeline.get_timeline_interface()
@@ -217,10 +266,16 @@ def main():
                     print(f"  drone{did}: {side} viewport -> {cam_path}")
                 handle["stereo_pub"].set_viewports(cam_viewports)
 
-        # Warm up renderer
-        print("  Warming up renderer...")
-        for _ in range(10):
+        # Warm up — let physics constraints settle before PX4 evaluates
+        print("  Warming up physics + renderer...")
+        for _ in range(120):
             world.step(render=True)
+
+        # Let arm drives settle
+        for _ in range(60):
+            world.step(render=True)
+            for bridge in arm_bridges:
+                bridge.apply_commands()
 
         # --- Print summary ---
         print("\n" + "=" * 70)
