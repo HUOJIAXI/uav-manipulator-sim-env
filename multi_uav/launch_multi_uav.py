@@ -56,6 +56,28 @@ def load_config(config_path):
                 print(f"WARNING: drone{a['id']} and drone{b['id']} are only "
                       f"{dist:.2f}m apart — risk of physics collision at spawn.")
 
+    # Validate ground robot IDs
+    ground_robots = cfg.get("ground_robots", [])
+    gr_id_set = set()
+    for i, gr in enumerate(ground_robots):
+        if "id" not in gr:
+            print(f"ERROR: Ground robot entry {i} missing required 'id' field.")
+            sys.exit(1)
+        gid = gr["id"]
+        if gid in gr_id_set:
+            print(f"ERROR: Duplicate ground_robot id={gid} in config.")
+            sys.exit(1)
+        gr_id_set.add(gid)
+
+    # Warn if ground robot spawns near a drone
+    for gr in ground_robots:
+        for d in drones:
+            dist = math.sqrt((gr.get("x", 0) - d.get("x", 0)) ** 2
+                             + (gr.get("y", 0) - d.get("y", 0)) ** 2)
+            if dist < 1.0:
+                print(f"WARNING: ground_robot{gr['id']} and drone{d['id']} are only "
+                      f"{dist:.2f}m apart — risk of collision at spawn.")
+
     return cfg
 
 
@@ -79,10 +101,12 @@ def main():
     spawn_height = cfg.get("spawn_height", 0.30)
     env_name = cfg.get("environment", "Curved Gridroom")
     drones_cfg = cfg["drones"]
+    ground_robots_cfg = cfg.get("ground_robots", [])
 
     num_drones = len(drones_cfg)
+    num_ground_robots = len(ground_robots_cfg)
     print("\n" + "=" * 70)
-    print(f"  Multi-UAV Launcher — {num_drones} drone(s)")
+    print(f"  Multi-UAV Launcher — {num_drones} drone(s), {num_ground_robots} ground robot(s)")
     print("=" * 70 + "\n")
 
     # --- Init SimulationApp ---
@@ -112,6 +136,7 @@ def main():
 
     # --- Spawning and simulation ---
     from spawn_uav import spawn_uav, create_stereo_cameras, create_arm, ArmBridgeNode, StereoCamPublisher, GroundTruthPublisher
+    from spawn_ground_robot import spawn_ground_robot, GroundRobotBridge
 
     stage = omni.usd.get_context().get_stage()
 
@@ -125,6 +150,15 @@ def main():
         handle.update(arm_result)
         drone_handles.append(handle)
         time.sleep(0.5)
+
+    # --- Spawn ground robots (before world.reset()) ---
+    ground_robot_handles = []
+    if ground_robots_cfg:
+        print("Spawning ground robots...")
+        for gr_cfg in ground_robots_cfg:
+            gr_handle = spawn_ground_robot(world, gr_cfg, simulation_app)
+            ground_robot_handles.append(gr_handle)
+            time.sleep(0.5)
 
     # --- world.reset() — PhysX initializes ALL bodies, joints, and drives ---
     print("Resetting world...")
@@ -199,6 +233,19 @@ def main():
             print(f"  drone{did}: stereo publisher node ready")
         else:
             handle["stereo_pub"] = None
+
+    ground_robot_bridges = []
+    for gr_handle in ground_robot_handles:
+        gid = gr_handle["robot_id"]
+        bridge = GroundRobotBridge(
+            gid,
+            gr_handle["wheeled_robot"],
+            uwb_noise_std=gr_handle["uwb_noise_std"],
+        )
+        executor.add_node(bridge)
+        ground_robot_bridges.append(bridge)
+        print(f"  ground_robot{gid}: bridge node ready "
+              f"(uwb_noise_std={gr_handle['uwb_noise_std']}m)")
 
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
     spin_thread.start()
@@ -291,6 +338,12 @@ def main():
             if handle.get("stereo_pub"):
                 print(f"    drone{did}/front_stereo_camera/left/image_rect_color")
                 print(f"    drone{did}/front_stereo_camera/right/image_rect_color")
+        for gr_handle in ground_robot_handles:
+            gid = gr_handle["robot_id"]
+            print(f"\n  ground_robot{gid}:")
+            print(f"    ground_robot{gid}/cmd_vel (geometry_msgs/Twist)")
+            print(f"    ground_robot{gid}/uwb/position (PointStamped, noise={gr_handle['uwb_noise_std']}m)")
+            print(f"    ground_robot{gid}/state/pose (ground truth)")
         print("\nPress Ctrl+C to exit\n")
 
         # --- Simulation loop ---
@@ -306,6 +359,10 @@ def main():
             for bridge in arm_bridges:
                 bridge.apply_commands()
 
+            # Apply ground robot velocities
+            for gr_bridge in ground_robot_bridges:
+                gr_bridge.apply_velocity()
+
             # Publish at ~10 Hz
             pub_counter += 1
             if pub_counter >= 6:
@@ -317,6 +374,9 @@ def main():
                     pub.capture_and_publish(sim_time)
                 for gt in gt_pubs:
                     gt.publish_pose(sim_time, stage)
+                for gr_bridge in ground_robot_bridges:
+                    gr_bridge.publish_uwb(sim_time, stage)
+                    gr_bridge.publish_pose(sim_time, stage)
 
     except KeyboardInterrupt:
         print("\nShutting down...")
@@ -328,6 +388,8 @@ def main():
             pub.destroy_node()
         for bridge in arm_bridges:
             bridge.destroy_node()
+        for gr_bridge in ground_robot_bridges:
+            gr_bridge.destroy_node()
         executor.shutdown()
         rclpy.try_shutdown()
         simulation_app.close()
