@@ -14,24 +14,24 @@ drones:
   - id: 1
     x: 2.0
     y: 0.0
-    yaw: 90.0
+    yaw: 0.0
     stereo_camera: true
     arm: true
     px4_autolaunch: true
     px4_vehicle_id: 1
 
-  - id: 2
-    x: 1.0
-    y: 2.0
-    yaw: 180.0
-    stereo_camera: true
-    arm: true
-    px4_autolaunch: true
-    px4_vehicle_id: 2
+  # - id: 2
+  #   x: 1.0
+  #   y: 2.0
+  #   yaw: 180.0
+  #   stereo_camera: true
+  #   arm: true
+  #   px4_autolaunch: true
+  #   px4_vehicle_id: 2
 
 ground_robots:
   - id: 0
-    x: 3.0
+    x: 1.0
     y: 0.0
     yaw: 0.0
-    uwb_noise_std: 0.1
+    uwb_noise_std: 0.05

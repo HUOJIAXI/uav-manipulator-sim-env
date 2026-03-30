@@ -136,7 +136,7 @@ def main():
 
     # --- Spawning and simulation ---
     from spawn_uav import spawn_uav, create_stereo_cameras, create_arm, ArmBridgeNode, StereoCamPublisher, GroundTruthPublisher
-    from spawn_ground_robot import spawn_ground_robot, GroundRobotBridge
+    from spawn_ground_robot import spawn_ground_robot, configure_wheel_drives, GroundRobotBridge
 
     stage = omni.usd.get_context().get_stage()
 
@@ -181,6 +181,10 @@ def main():
         print(f"  PhysX solver iterations set (pos: 32-64, vel: 16-32)")
     else:
         print("  WARNING: PhysicsScene not found — solver iterations not tuned")
+
+    # --- Configure ground robot wheel drives (after world.reset()) ---
+    for gr_handle in ground_robot_handles:
+        configure_wheel_drives(gr_handle["wheeled_robot"], gr_handle["robot_id"])
 
     # --- Phase 2: Create cameras (after world.reset(), no physics needed) ---
     print("Creating stereo cameras...")

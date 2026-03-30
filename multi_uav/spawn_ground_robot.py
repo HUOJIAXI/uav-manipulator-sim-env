@@ -18,7 +18,9 @@ JETBOT_WHEEL_RADIUS = 0.03      # meters
 JETBOT_WHEEL_BASE = 0.1125      # meters
 JETBOT_SPAWN_Z = 0.05           # slight offset above ground
 
-DEFAULT_UWB_NOISE_STD = 0.1     # meters
+DEFAULT_UWB_NOISE_STD = 0.05    # meters
+
+DEFAULT_MAX_SPEED = 2.0         # m/s, configurable via YAML
 
 
 def spawn_ground_robot(world, robot_cfg, sim_app):
@@ -78,6 +80,22 @@ def spawn_ground_robot(world, robot_cfg, sim_app):
     }
 
 
+def configure_wheel_drives(wheeled_robot, robot_id):
+    """
+    Increase wheel joint velocity and effort limits after world.reset().
+
+    Uses the Isaac Sim articulation API to properly set DOF properties
+    on the WheeledRobot's wheel joints.
+    """
+    num_dof = wheeled_robot._articulation_view.num_dof
+    max_vels = np.ones((1, num_dof)) * 200.0   # rad/s (~6 m/s ground speed)
+    max_efforts = np.ones((1, num_dof)) * 50.0  # Nm
+    wheeled_robot._articulation_view.set_max_joint_velocities(max_vels)
+    wheeled_robot._articulation_view.set_max_efforts(max_efforts)
+    print(f"  ground_robot{robot_id}: wheel drive limits raised "
+          f"(max_vel=200 rad/s, max_effort=50 Nm)")
+
+
 class GroundRobotBridge(RclpyNode):
     """ROS2 node for ground robot velocity control and UWB position publishing."""
 
@@ -125,46 +143,35 @@ class GroundRobotBridge(RclpyNode):
 
     def publish_uwb(self, stamp_sec, stage):
         """Publish noisy UWB position. Call at 10 Hz from sim loop."""
-        prim = stage.GetPrimAtPath(self.prim_path)
-        if not prim.IsValid():
+        position, _ = self.wheeled_robot.get_world_pose()
+        if position is None:
             return
-
-        xformable = UsdGeom.Xformable(prim)
-        world_tf = xformable.ComputeLocalToWorldTransform(0)
-        pos = world_tf.ExtractTranslation()
 
         msg = PointStamped()
         msg.header.stamp.sec = int(stamp_sec)
         msg.header.stamp.nanosec = int((stamp_sec - int(stamp_sec)) * 1e9)
         msg.header.frame_id = "map"
-        msg.point.x = float(pos[0]) + np.random.normal(0.0, self.uwb_noise_std)
-        msg.point.y = float(pos[1]) + np.random.normal(0.0, self.uwb_noise_std)
-        msg.point.z = float(pos[2]) + np.random.normal(0.0, self.uwb_noise_std)
+        msg.point.x = float(position[0]) + np.random.normal(0.0, self.uwb_noise_std)
+        msg.point.y = float(position[1]) + np.random.normal(0.0, self.uwb_noise_std)
+        msg.point.z = float(position[2]) + np.random.normal(0.0, self.uwb_noise_std)
         self.uwb_pub.publish(msg)
 
     def publish_pose(self, stamp_sec, stage):
         """Publish clean ground truth pose. Call at 10 Hz from sim loop."""
-        prim = stage.GetPrimAtPath(self.prim_path)
-        if not prim.IsValid():
+        position, orientation = self.wheeled_robot.get_world_pose()
+        if position is None:
             return
-
-        xformable = UsdGeom.Xformable(prim)
-        world_tf = xformable.ComputeLocalToWorldTransform(0)
-        pos = world_tf.ExtractTranslation()
-        rot = world_tf.ExtractRotation()
-        quat = rot.GetQuat()
-        qi = quat.GetImaginary()
-        qr = quat.GetReal()
 
         msg = PoseStamped()
         msg.header.stamp.sec = int(stamp_sec)
         msg.header.stamp.nanosec = int((stamp_sec - int(stamp_sec)) * 1e9)
         msg.header.frame_id = "map"
-        msg.pose.position.x = float(pos[0])
-        msg.pose.position.y = float(pos[1])
-        msg.pose.position.z = float(pos[2])
-        msg.pose.orientation.x = float(qi[0])
-        msg.pose.orientation.y = float(qi[1])
-        msg.pose.orientation.z = float(qi[2])
-        msg.pose.orientation.w = float(qr)
+        msg.pose.position.x = float(position[0])
+        msg.pose.position.y = float(position[1])
+        msg.pose.position.z = float(position[2])
+        # orientation is [w, x, y, z] from Isaac Sim
+        msg.pose.orientation.x = float(orientation[1])
+        msg.pose.orientation.y = float(orientation[2])
+        msg.pose.orientation.z = float(orientation[3])
+        msg.pose.orientation.w = float(orientation[0])
         self.pose_pub.publish(msg)
