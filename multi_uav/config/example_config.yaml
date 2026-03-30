@@ -28,3 +28,10 @@ drones:
     arm: true
     px4_autolaunch: true
     px4_vehicle_id: 2
+
+ground_robots:
+  - id: 0
+    x: 3.0
+    y: 0.0
+    yaw: 0.0
+    uwb_noise_std: 0.1

@@ -10,3 +10,5 @@ drones:
     arm: true
     px4_autolaunch: true
     px4_vehicle_id: 0
+
+ground_robots: []
