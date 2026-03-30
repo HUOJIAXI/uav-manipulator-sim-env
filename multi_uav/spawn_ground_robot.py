@@ -5,27 +5,33 @@ import threading
 
 import numpy as np
 from scipy.spatial.transform import Rotation
-from pxr import UsdGeom, Gf
+from pxr import UsdGeom, UsdShade, Sdf, Gf
 
 import rclpy
 from rclpy.node import Node as RclpyNode
 from geometry_msgs.msg import Twist, PoseStamped, PointStamped
 
-# Jetbot parameters (from Isaac Sim example)
-JETBOT_ASSET_SUBPATH = "/Isaac/Robots/NVIDIA/Jetbot/jetbot.usd"
-JETBOT_WHEEL_DOF_NAMES = ["left_wheel_joint", "right_wheel_joint"]
-JETBOT_WHEEL_RADIUS = 0.03      # meters
-JETBOT_WHEEL_BASE = 0.1125      # meters
-JETBOT_SPAWN_Z = 0.05           # slight offset above ground
+# Nova Carter parameters
+ROBOT_ASSET_SUBPATH = "/Isaac/Robots/NVIDIA/NovaCarter/nova_carter.usd"
+ROBOT_WHEEL_DOF_NAMES = ["joint_wheel_left", "joint_wheel_right"]
+ROBOT_WHEEL_RADIUS = 0.14       # meters
+ROBOT_WHEEL_BASE = 0.4132       # meters
+ROBOT_SPAWN_Z = 0.0             # Nova Carter sits at ground level
 
 DEFAULT_UWB_NOISE_STD = 0.05    # meters
-
 DEFAULT_MAX_SPEED = 2.0         # m/s, configurable via YAML
+
+# AprilTag parameters
+APRILTAG_MDL_SUBPATH = "/Isaac/Materials/AprilTag/AprilTag.mdl"
+APRILTAG_TEXTURE_SUBPATH = "/Isaac/Materials/AprilTag/Textures/tag36h11.png"
+APRILTAG_SIZE = 0.40            # meters — roughly matching Nova Carter top surface
+APRILTAG_X_OFFSET = 0.05         # meters forward from robot origin
+APRILTAG_HEIGHT_OFFSET = 0.45   # meters above robot origin (top of Nova Carter)
 
 
 def spawn_ground_robot(world, robot_cfg, sim_app):
     """
-    Spawn a Jetbot ground robot into the Isaac Sim world.
+    Spawn a Nova Carter ground robot into the Isaac Sim world.
 
     Must be called BEFORE world.reset().
 
@@ -49,7 +55,7 @@ def spawn_ground_robot(world, robot_cfg, sim_app):
     assets_root = get_assets_root_path()
     if assets_root is None:
         raise RuntimeError("Could not find Isaac Sim assets folder (Nucleus)")
-    jetbot_usd = assets_root + JETBOT_ASSET_SUBPATH
+    robot_usd = assets_root + ROBOT_ASSET_SUBPATH
 
     prim_path = f"/World/ground_robot{robot_id}"
 
@@ -63,15 +69,15 @@ def spawn_ground_robot(world, robot_cfg, sim_app):
         WheeledRobot(
             prim_path=prim_path,
             name=f"ground_robot{robot_id}",
-            wheel_dof_names=JETBOT_WHEEL_DOF_NAMES,
+            wheel_dof_names=ROBOT_WHEEL_DOF_NAMES,
             create_robot=True,
-            usd_path=jetbot_usd,
-            position=np.array([x, y, JETBOT_SPAWN_Z]),
+            usd_path=robot_usd,
+            position=np.array([x, y, ROBOT_SPAWN_Z]),
             orientation=orientation,
         )
     )
     sim_app.update()
-    print(f"  ground_robot{robot_id}: Jetbot spawned at ({x}, {y}), yaw={yaw}")
+    print(f"  ground_robot{robot_id}: Nova Carter spawned at ({x}, {y}), yaw={yaw}")
 
     return {
         "robot_id": robot_id,
@@ -84,16 +90,119 @@ def configure_wheel_drives(wheeled_robot, robot_id):
     """
     Increase wheel joint velocity and effort limits after world.reset().
 
-    Uses the Isaac Sim articulation API to properly set DOF properties
-    on the WheeledRobot's wheel joints.
+    Targets only the two wheel joints by index, leaving other DOFs unchanged.
     """
-    num_dof = wheeled_robot._articulation_view.num_dof
-    max_vels = np.ones((1, num_dof)) * 200.0   # rad/s (~6 m/s ground speed)
-    max_efforts = np.ones((1, num_dof)) * 50.0  # Nm
-    wheeled_robot._articulation_view.set_max_joint_velocities(max_vels)
-    wheeled_robot._articulation_view.set_max_efforts(max_efforts)
-    print(f"  ground_robot{robot_id}: wheel drive limits raised "
-          f"(max_vel=200 rad/s, max_effort=50 Nm)")
+    av = wheeled_robot._articulation_view
+    num_dof = av.num_dof
+
+    # Find wheel joint indices
+    wheel_indices = []
+    for name in ROBOT_WHEEL_DOF_NAMES:
+        idx = av.get_dof_index(name)
+        wheel_indices.append(idx)
+    print(f"  ground_robot{robot_id}: num_dof={num_dof}, "
+          f"wheel indices={wheel_indices}")
+
+    # Set limits only on wheel joints
+    n_wheels = len(wheel_indices)
+    max_vels = np.ones((1, n_wheels)) * 50.0    # rad/s (~7 m/s with 0.14m radius)
+    max_efforts = np.ones((1, n_wheels)) * 100.0  # Nm
+    av.set_max_joint_velocities(max_vels, joint_indices=wheel_indices)
+    av.set_max_efforts(max_efforts, joint_indices=wheel_indices)
+
+    # Verify the values were applied
+    cur_vels = av.get_joint_max_velocities(joint_indices=wheel_indices)
+    cur_efforts = av.get_max_efforts(joint_indices=wheel_indices)
+    print(f"  ground_robot{robot_id}: wheel limits set — "
+          f"max_vel={cur_vels}, max_effort={cur_efforts}")
+
+
+def create_apriltag_on_robot(stage, robot_id, sim_app):
+    """
+    Place an AprilTag (tag36h11, ID 0) on top of the Nova Carter.
+
+    Creates a flat plane as a child of the robot's chassis_link so it
+    moves with the robot. Applies the Isaac Sim built-in AprilTag MDL material.
+
+    Must be called AFTER world.reset() and timeline.play() for material creation.
+    """
+    import omni.kit.commands
+    from isaacsim.storage.native import get_assets_root_path
+
+    assets_root = get_assets_root_path()
+    robot_prim_path = f"/World/ground_robot{robot_id}"
+
+    # Find the chassis link to parent the tag to
+    chassis_path = f"{robot_prim_path}/chassis_link"
+    chassis_prim = stage.GetPrimAtPath(chassis_path)
+    if not chassis_prim.IsValid():
+        # Fallback: parent to the robot root
+        chassis_path = robot_prim_path
+        print(f"  ground_robot{robot_id}: WARNING — chassis_link not found, "
+              f"parenting AprilTag to robot root")
+
+    # Create a plane mesh as child of chassis
+    tag_path = f"{chassis_path}/apriltag_plane"
+    plane = UsdGeom.Mesh.Define(stage, tag_path)
+
+    # A flat quad facing up (+Z), centered on the robot
+    half = APRILTAG_SIZE / 2.0
+    plane.GetPointsAttr().Set([
+        Gf.Vec3f(-half, -half, 0),
+        Gf.Vec3f(half, -half, 0),
+        Gf.Vec3f(half, half, 0),
+        Gf.Vec3f(-half, half, 0),
+    ])
+    plane.GetFaceVertexCountsAttr().Set([4])
+    plane.GetFaceVertexIndicesAttr().Set([0, 1, 2, 3])
+    plane.GetNormalsAttr().Set([
+        Gf.Vec3f(0, 0, 1), Gf.Vec3f(0, 0, 1),
+        Gf.Vec3f(0, 0, 1), Gf.Vec3f(0, 0, 1),
+    ])
+    plane.SetNormalsInterpolation("vertex")
+
+    # UV coordinates for the texture
+    primvars_api = UsdGeom.PrimvarsAPI(plane)
+    texcoords = primvars_api.CreatePrimvar(
+        "st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex
+    )
+    texcoords.Set([
+        Gf.Vec2f(0, 0), Gf.Vec2f(1, 0),
+        Gf.Vec2f(1, 1), Gf.Vec2f(0, 1),
+    ])
+
+    # Position on top of the robot
+    xform = UsdGeom.Xformable(plane)
+    xform.ClearXformOpOrder()
+    xform.AddTranslateOp().Set(Gf.Vec3d(APRILTAG_X_OFFSET, 0, APRILTAG_HEIGHT_OFFSET))
+
+    sim_app.update()
+
+    # Create AprilTag MDL material
+    mtl_path = f"{robot_prim_path}/Looks/AprilTag"
+    omni.kit.commands.execute(
+        "CreateMdlMaterialPrim",
+        mtl_url=assets_root + APRILTAG_MDL_SUBPATH,
+        mtl_name="AprilTag",
+        mtl_path=mtl_path,
+        select_new_prim=False,
+    )
+    sim_app.update()
+
+    # Set the tag texture (tag36h11 mosaic — ID 0 is the default tile)
+    shader_prim = stage.GetPrimAtPath(mtl_path + "/Shader")
+    if shader_prim.IsValid():
+        attr = shader_prim.CreateAttribute("inputs:tag_mosaic", Sdf.ValueTypeNames.Asset)
+        attr.Set(Sdf.AssetPath(assets_root + APRILTAG_TEXTURE_SUBPATH))
+
+    # Bind material to the plane
+    material = UsdShade.Material(stage.GetPrimAtPath(mtl_path))
+    if material:
+        UsdShade.MaterialBindingAPI.Apply(plane.GetPrim()).Bind(material)
+
+    sim_app.update()
+    print(f"  ground_robot{robot_id}: AprilTag (tag36h11) placed on top "
+          f"({APRILTAG_SIZE}m, z_offset={APRILTAG_HEIGHT_OFFSET}m)")
 
 
 class GroundRobotBridge(RclpyNode):
@@ -113,8 +222,8 @@ class GroundRobotBridge(RclpyNode):
         from isaacsim.robot.wheeled_robots.controllers.differential_controller import DifferentialController
         self.controller = DifferentialController(
             name=f"ground_robot{robot_id}_controller",
-            wheel_radius=JETBOT_WHEEL_RADIUS,
-            wheel_base=JETBOT_WHEEL_BASE,
+            wheel_radius=ROBOT_WHEEL_RADIUS,
+            wheel_base=ROBOT_WHEEL_BASE,
         )
 
         prefix = f"ground_robot{robot_id}"

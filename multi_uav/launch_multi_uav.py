@@ -135,8 +135,8 @@ def main():
     print("  Environment loaded\n")
 
     # --- Spawning and simulation ---
-    from spawn_uav import spawn_uav, create_stereo_cameras, create_arm, ArmBridgeNode, StereoCamPublisher, GroundTruthPublisher
-    from spawn_ground_robot import spawn_ground_robot, configure_wheel_drives, GroundRobotBridge
+    from spawn_uav import spawn_uav, create_stereo_cameras, create_downward_camera, create_arm, ArmBridgeNode, StereoCamPublisher, DownwardCamPublisher, GroundTruthPublisher
+    from spawn_ground_robot import spawn_ground_robot, configure_wheel_drives, create_apriltag_on_robot, GroundRobotBridge
 
     stage = omni.usd.get_context().get_stage()
 
@@ -182,15 +182,18 @@ def main():
     else:
         print("  WARNING: PhysicsScene not found — solver iterations not tuned")
 
-    # --- Configure ground robot wheel drives (after world.reset()) ---
+    # --- Configure ground robot wheel drives and AprilTags (after world.reset()) ---
     for gr_handle in ground_robot_handles:
         configure_wheel_drives(gr_handle["wheeled_robot"], gr_handle["robot_id"])
+        create_apriltag_on_robot(stage, gr_handle["robot_id"], simulation_app)
 
     # --- Phase 2: Create cameras (after world.reset(), no physics needed) ---
-    print("Creating stereo cameras...")
+    print("Creating cameras...")
     for i, dcfg in enumerate(drones_cfg):
         cam_paths = create_stereo_cameras(stage, dcfg, spawn_height, simulation_app)
         drone_handles[i]["stereo_cam_paths"] = cam_paths
+        down_cam_path = create_downward_camera(stage, dcfg, spawn_height, simulation_app)
+        drone_handles[i]["downward_cam_path"] = down_cam_path
 
     # --- ROS2 setup ---
     print("Setting up ROS2...")
@@ -203,6 +206,7 @@ def main():
 
     arm_bridges = []
     stereo_pubs = []
+    downward_pubs = []
     gt_pubs = []
 
     for handle in drone_handles:
@@ -237,6 +241,15 @@ def main():
             print(f"  drone{did}: stereo publisher node ready")
         else:
             handle["stereo_pub"] = None
+
+        # Downward camera publisher
+        if handle.get("downward_cam_path"):
+            dpub = DownwardCamPublisher(did)
+            downward_pubs.append(dpub)
+            handle["downward_pub"] = dpub
+            print(f"  drone{did}: downward camera publisher ready")
+        else:
+            handle["downward_pub"] = None
 
     ground_robot_bridges = []
     for gr_handle in ground_robot_handles:
@@ -317,6 +330,25 @@ def main():
                     print(f"  drone{did}: {side} viewport -> {cam_path}")
                 handle["stereo_pub"].set_viewports(cam_viewports)
 
+        # --- Downward camera viewports (must be after timeline.play()) ---
+        DOWNWARD_CAM_RESOLUTION = (640, 480)
+
+        for handle in drone_handles:
+            if handle.get("downward_cam_path") and handle.get("downward_pub"):
+                did = handle["drone_id"]
+                cam_path = handle["downward_cam_path"]
+                vp_name = f"drone{did}_downward"
+                vp_window = vp_utils.create_viewport_window(
+                    vp_name,
+                    width=DOWNWARD_CAM_RESOLUTION[0],
+                    height=DOWNWARD_CAM_RESOLUTION[1],
+                    visible=False,
+                )
+                vp_api = vp_window.viewport_api
+                vp_api.set_active_camera(cam_path)
+                handle["downward_pub"].set_viewport(vp_api, vp_window)
+                print(f"  drone{did}: downward viewport -> {cam_path}")
+
         # Warm up — let physics constraints settle before PX4 evaluates
         print("  Warming up physics + renderer...")
         for _ in range(120):
@@ -342,6 +374,9 @@ def main():
             if handle.get("stereo_pub"):
                 print(f"    drone{did}/front_stereo_camera/left/image_rect_color")
                 print(f"    drone{did}/front_stereo_camera/right/image_rect_color")
+            if handle.get("downward_pub"):
+                print(f"    drone{did}/downward_camera/image_rect_color")
+                print(f"    drone{did}/downward_camera/camera_info")
         for gr_handle in ground_robot_handles:
             gid = gr_handle["robot_id"]
             print(f"\n  ground_robot{gid}:")
@@ -376,6 +411,8 @@ def main():
                     bridge.publish_states(sim_time)
                 for pub in stereo_pubs:
                     pub.capture_and_publish(sim_time)
+                for dpub in downward_pubs:
+                    dpub.capture_and_publish(sim_time)
                 for gt in gt_pubs:
                     gt.publish_pose(sim_time, stage)
                 for gr_bridge in ground_robot_bridges:
@@ -390,6 +427,8 @@ def main():
             gt.destroy_node()
         for pub in stereo_pubs:
             pub.destroy_node()
+        for dpub in downward_pubs:
+            dpub.destroy_node()
         for bridge in arm_bridges:
             bridge.destroy_node()
         for gr_bridge in ground_robot_bridges:

@@ -29,6 +29,13 @@ STEREO_BASELINE = 0.050       # 50 mm
 CAMERA_FORWARD = 0.10         # 10 cm forward from body centre
 CAMERA_UP = 0.05              # 5 cm above body centre
 
+# Downward camera constants
+DOWNWARD_CAM_Z = -0.05            # 5 cm below body centre
+# Downward-facing: camera -Z should point along body -Z (down).
+# With identity rotation, camera axes = body axes, so -Z_cam = -Z_body = down.
+# Rotate 90° around Z so image top = body forward (+X).
+DOWNWARD_CAM_QUAT = Rotation.from_euler('z', -90, degrees=True).as_quat()
+
 # Landing leg constants
 LEG_LENGTH = 0.20             # 20 cm
 LEG_RADIUS = 0.005            # 5 mm
@@ -176,6 +183,51 @@ def create_stereo_cameras(stage, drone_cfg, spawn_height, sim_app):
     sim_app.update()
 
     return stereo_cam_paths
+
+
+def create_downward_camera(stage, drone_cfg, spawn_height, sim_app):
+    """
+    Creates a downward-facing camera under a drone. Must be called AFTER world.reset().
+
+    Camera is a child of the drone body prim so it follows via USD hierarchy.
+
+    Args:
+        stage: USD stage
+        drone_cfg: dict from YAML config for this drone
+        spawn_height: float, Z height for spawning
+        sim_app: SimulationApp instance
+
+    Returns:
+        str cam prim path, or None if disabled
+    """
+    drone_id = drone_cfg["id"]
+    if not drone_cfg.get("downward_camera", True):
+        return None
+
+    prefix = f"/World/drone{drone_id}"
+    body_path = f"{prefix}/quadrotor/body"
+
+    # Mount as child of body
+    mount_path = f"{body_path}/downward_cam"
+    mount_xform = UsdGeom.Xform.Define(stage, mount_path)
+    mx = UsdGeom.Xformable(mount_xform)
+    mx.ClearXformOpOrder()
+    mx.AddTranslateOp().Set(Gf.Vec3d(0, 0, DOWNWARD_CAM_Z))
+
+    # Camera prim with downward orientation
+    cam_q = DOWNWARD_CAM_QUAT
+    cam_quat_gf = Gf.Quatf(float(cam_q[3]), float(cam_q[0]), float(cam_q[1]), float(cam_q[2]))
+
+    cam_path = f"{mount_path}/camera"
+    cam_prim = stage.DefinePrim(cam_path, "Camera")
+    cam_xf = UsdGeom.Xformable(cam_prim)
+    cam_xf.ClearXformOpOrder()
+    cam_xf.AddOrientOp().Set(cam_quat_gf)
+
+    sim_app.update()
+    print(f"  drone{drone_id}: downward camera at {cam_path}")
+
+    return cam_path
 
 
 def create_arm(stage, drone_cfg, spawn_height, sim_app):
@@ -512,3 +564,85 @@ class StereoCamPublisher(RclpyNode):
                     carb.log_warn(f"Capture publish error (drone{self.drone_id}): {e}")
 
             vp_api.schedule_capture(ByteCapture(_on_capture))
+
+
+class DownwardCamPublisher(RclpyNode):
+    """Per-drone ROS2 node for downward camera image publishing."""
+
+    def __init__(self, drone_id):
+        super().__init__(f"drone{drone_id}_downward_cam_publisher")
+        self.drone_id = drone_id
+        self.viewport_api = None  # injected after timeline.play()
+
+        prefix = f"drone{drone_id}"
+        self.img_pub = self.create_publisher(
+            Image, f"{prefix}/downward_camera/image_rect", 1
+        )
+        self.info_pub = self.create_publisher(
+            CameraInfoMsg, f"{prefix}/downward_camera/camera_info", 1
+        )
+
+    def set_viewport(self, viewport_api, viewport_window):
+        """Inject viewport reference after timeline.play()."""
+        self.viewport_api = viewport_api
+        self._viewport_window = viewport_window  # prevent garbage collection
+
+    def capture_and_publish(self, stamp_sec):
+        if self.viewport_api is None:
+            return
+
+        from omni.kit.widget.viewport.capture import ByteCapture
+
+        stamp = TimeMsg()
+        stamp.sec = int(stamp_sec)
+        stamp.nanosec = int((stamp_sec - int(stamp_sec)) * 1e9)
+
+        img_pub = self.img_pub
+        info_pub = self.info_pub
+        frame_id = f"drone{self.drone_id}_downward_camera_optical"
+
+        def _on_capture(buffer, buffer_size, width, height, fmt,
+                        _pub=img_pub, _info_pub=info_pub,
+                        _stamp=stamp, _frame_id=frame_id):
+            if buffer is None or buffer_size == 0:
+                return
+            try:
+                ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p
+                ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [
+                    ctypes.py_object, ctypes.c_char_p
+                ]
+                ptr = ctypes.pythonapi.PyCapsule_GetPointer(buffer, None)
+                raw_bytes = (ctypes.c_ubyte * buffer_size).from_address(ptr)
+
+                header = Header()
+                header.stamp = _stamp
+                header.frame_id = _frame_id
+
+                img_msg = Image()
+                img_msg.header = header
+                img_msg.height = height
+                img_msg.width = width
+                img_msg.encoding = "rgba8"
+                img_msg.step = width * 4
+                img_msg.is_bigendian = False
+                img_msg.data = bytes(raw_bytes)
+                _pub.publish(img_msg)
+
+                info_msg = CameraInfoMsg()
+                info_msg.header = header
+                info_msg.height = height
+                info_msg.width = width
+                info_msg.distortion_model = "plumb_bob"
+                info_msg.d = [0.0, 0.0, 0.0, 0.0, 0.0]
+                fx = float(width)
+                fy = fx
+                cx = width / 2.0
+                cy = height / 2.0
+                info_msg.k = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
+                info_msg.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+                info_msg.p = [fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0]
+                _info_pub.publish(info_msg)
+            except Exception as e:
+                carb.log_warn(f"Downward capture error (drone{self.drone_id}): {e}")
+
+        self.viewport_api.schedule_capture(ByteCapture(_on_capture))
