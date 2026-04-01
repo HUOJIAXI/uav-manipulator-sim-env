@@ -6,7 +6,7 @@ drones:
     x: 0.0
     y: 0.0
     yaw: 0.0
-    stereo_camera: true
+    stereo_camera: false
     arm: true
     px4_autolaunch: true
     px4_vehicle_id: 0
@@ -15,7 +15,7 @@ drones:
     x: 2.0
     y: 0.0
     yaw: 0.0
-    stereo_camera: true
+    stereo_camera: false
     arm: true
     px4_autolaunch: true
     px4_vehicle_id: 1
